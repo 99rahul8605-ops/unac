@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+.state/
+downloads/
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+*.db
+*.sqlite*
+*.log
+browser_profile/
