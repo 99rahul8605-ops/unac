@@ -1,65 +1,51 @@
 import os
-import re
 import json
-import time
+import re
 import asyncio
 import sqlite3
 import logging
+import time
 from pathlib import Path
-
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 
-from catalog import (
-    discover_goals,
-    discover_batches,
-    discover_subjects,
-    discover_classes,
-)
+from catalog import goals, batches, subjects, classes
 from downloader import download_lecture
 from storage import Storage
-
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 STATE = ROOT / ".state"
-DOWNLOADS = ROOT / "downloads"
+FILES = ROOT / "downloads"
 
 STATE.mkdir(exist_ok=True)
-DOWNLOADS.mkdir(exist_ok=True)
+FILES.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    filename=STATE / "errors.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-
-REQUIRED = [
-    "API_ID",
-    "API_HASH",
-    "BOT_TOKEN",
-    "OWNER_ID",
-    "STORAGE_GROUP_ID",
-    "MONGODB_URI",
+required = [
+    "API_ID", "API_HASH", "BOT_TOKEN",
+    "OWNER_ID", "STORAGE_GROUP_ID", "MONGODB_URI",
 ]
 
-missing = [key for key in REQUIRED if not os.getenv(key)]
+missing = [x for x in required if not os.getenv(x)]
 
 if missing:
     raise SystemExit(
         "Missing .env settings: " + ", ".join(missing)
     )
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+OWNER = int(os.environ["OWNER_ID"])
+PROFILE = STATE / "browser_profile"
 
-client = TelegramClient(
+logging.basicConfig(
+    filename=STATE / "errors.log",
+    level=logging.INFO,
+)
+
+tg = TelegramClient(
     str(STATE / "manager_session"),
-    API_ID,
-    API_HASH,
+    int(os.environ["API_ID"]),
+    os.environ["API_HASH"],
 )
 
 storage = Storage()
@@ -69,13 +55,11 @@ sql.execute("""
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     payload TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
+    status TEXT DEFAULT 'queued',
     done INTEGER DEFAULT 0,
-    errors INTEGER DEFAULT 0,
-    stage TEXT DEFAULT 'Queued'
+    errors INTEGER DEFAULT 0
 )
 """)
-
 sql.execute(
     "UPDATE jobs SET status='queued' WHERE status='running'"
 )
@@ -85,14 +69,12 @@ menus = {}
 paused = False
 cancel_requested = False
 
-status = {
+activity = {
     "stage": "Idle",
     "lecture": "",
-    "subject": "",
-    "percent": 0.0,
 }
 
-last_progress_at = 0
+last_update = 0
 progress_message = None
 
 
@@ -101,225 +83,613 @@ def clean_error(error):
         r"([?&]k=)[^&\s]+",
         r"\1[hidden]",
         str(error),
-    )[:650]
+    )[:500]
+
+
+def menu_text(items, label, page):
+    per_page = 10
+    start = page * per_page
+    end = min(start + per_page, len(items))
+    pages = max(1, (len(items) + per_page - 1) // per_page)
+
+    lines = [
+        label,
+        "",
+    ]
+
+    for index in range(start, end):
+        lines.append(
+            f"{index + 1}. {items[index]['name'][:130]}"
+        )
+
+    lines.extend([
+        "",
+        f"Page {page + 1}/{pages} | Total {len(items)}",
+        "Item select karne ke liye neeche button dabao.",
+    ])
+
+    return "\n".join(lines)
+
+
+def menu_buttons(items, page):
+    start = page * 10
+    end = min(start + 10, len(items))
+
+    rows = []
+
+    for index in range(start, end):
+        name = items[index]["name"][:29]
+        rows.append([
+            Button.inline(
+                f"{index + 1}. {name}",
+                f"pick:{index}".encode(),
+            )
+        ])
+
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            Button.inline(
+                "⬅️ Previous",
+                b"page:prev",
+            )
+        )
+
+    if end < len(items):
+        navigation.append(
+            Button.inline(
+                "Next ➡️",
+                b"page:next",
+            )
+        )
+
+    if navigation:
+        rows.append(navigation)
+
+    return rows
+
+
+async def show_menu(event, state, edit=False):
+    field = {
+        "goal": "goals",
+        "pack": "packs",
+        "subjects": "subjects",
+    }[state["step"]]
+
+    titles = {
+        "goal": "🎯 Select your goal",
+        "pack": "📦 Select pack / batch",
+        "subjects": "📚 Select subjects",
+    }
+
+    items = state[field]
+    page = state.get("page", 0)
+
+    text = menu_text(
+        items, titles[state["step"]], page
+    )
+    buttons = menu_buttons(items, page)
+
+    if state["step"] == "subjects":
+        buttons.append([
+            Button.inline(
+                "✅ Select ALL subjects",
+                b"select:all",
+            )
+        ])
+        text += "\n\nYa 1,3,5 type kar sakte ho."
+
+    if edit:
+        await event.edit(text, buttons=buttons)
+    else:
+        await event.respond(text, buttons=buttons)
 
 
 async def notify(text):
     try:
-        await client.send_message(
-            OWNER_ID,
-            text[:4000],
-        )
+        await tg.send_message(OWNER, text[:4000])
     except Exception:
-        logging.exception("DM notification failed")
+        logging.exception("Owner DM failed")
 
 
 async def live(text, force=False):
-    global last_progress_at, progress_message
+    global last_update, progress_message
 
     current = time.monotonic()
 
-    if not force and current - last_progress_at < 8:
+    if not force and current - last_update < 8:
         return
 
-    last_progress_at = current
+    last_update = current
 
     try:
         if progress_message:
-            await client.edit_message(
-                OWNER_ID,
+            await tg.edit_message(
+                OWNER,
                 progress_message.id,
                 text[:3900],
             )
         else:
-            progress_message = await client.send_message(
-                OWNER_ID,
+            progress_message = await tg.send_message(
+                OWNER,
                 text[:3900],
             )
     except Exception:
-        logging.exception("Live progress failed")
+        logging.exception("Progress message failed")
 
 
-def numbered(items, title, page_number=0):
-    start = page_number * 20
-    end = min(start + 20, len(items))
+async def confirm(event, state):
+    chosen = state["chosen"]
 
-    lines = [title, ""]
+    lines = [
+        "📋 Confirm download and upload",
+        "",
+        "Goal: " + state["goal"]["name"],
+        "Pack: " + state["pack"]["name"],
+        f"Subjects: {len(chosen)}",
+        "",
+        "Authorized content only.",
+    ]
 
-    for index in range(start, end):
-        lines.append(
-            f"{index + 1}. {items[index]['name'][:105]}"
+    state["step"] = "confirm"
+
+    await event.respond(
+        "\n".join(lines),
+        buttons=[[
+            Button.inline("✅ YES", b"confirm:yes"),
+            Button.inline("❌ NO", b"confirm:no"),
+        ]],
+    )
+
+
+@tg.on(events.NewMessage(incoming=True))
+async def message_handler(event):
+    global paused, cancel_requested
+
+    if not event.is_private or event.sender_id != OWNER:
+        return
+
+    message = event.raw_text.strip()
+    low = message.lower()
+
+    if low in ("/start", "/search"):
+        menus[OWNER] = {"step": "category", "page": 0}
+
+        await event.respond(
+            "🤖 Lecture Manager\n\n"
+            "Category/search keyword bhejo.\n"
+            "Example: CA / CA Foundation / UPSC\n\n"
+            "/status /pause /resume /cancel /retry"
+        )
+        return
+
+    if low == "/status":
+        jobs = sql.execute(
+            "SELECT id,status,done,errors FROM jobs "
+            "ORDER BY id DESC LIMIT 4"
+        ).fetchall()
+
+        text = [
+            "Stage: " + activity["stage"],
+            "Lecture: " + activity["lecture"],
+            "Paused: " + str(paused),
+        ]
+
+        text += [
+            f"Job #{i}: {s} | done={d} | errors={e}"
+            for i, s, d, e in jobs
+        ]
+
+        await event.respond("\n".join(text))
+        return
+
+    if low == "/pause":
+        paused = True
+        await event.respond("⏸ Queue paused.")
+        return
+
+    if low == "/resume":
+        paused = False
+        await event.respond("▶️ Queue resumed.")
+        return
+
+    if low == "/cancel":
+        cancel_requested = True
+        await event.respond(
+            "🛑 Cancellation requested."
+        )
+        return
+
+    if low == "/retry":
+        row = sql.execute(
+            "SELECT id FROM jobs WHERE status IN "
+            "('failed','completed_with_errors') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        if not row:
+            await event.respond("No failed job.")
+        else:
+            sql.execute(
+                "UPDATE jobs SET status='queued' WHERE id=?",
+                (row[0],),
+            )
+            sql.commit()
+            await event.respond(
+                f"♻️ Job #{row[0]} queued."
+            )
+        return
+
+    state = menus.get(OWNER)
+
+    if not state:
+        await event.respond("Send /start")
+        return
+
+    if state["step"] == "category":
+        await event.respond("🔎 Searching goals...")
+
+        try:
+            items = await goals(PROFILE, message)
+        except Exception as error:
+            await event.respond(
+                "Goal discovery failed:\n"
+                + clean_error(error)
+            )
+            return
+
+        if not items:
+            await event.respond(
+                "No goals found. Try another search term."
+            )
+            return
+
+        state.update({
+            "step": "goal",
+            "goals": items,
+            "page": 0,
+        })
+
+        await show_menu(event, state)
+        return
+
+    if state["step"] == "subjects":
+        try:
+            indices = [
+                int(x.strip()) for x in message.split(",")
+            ]
+
+            if not indices or any(
+                x < 1 or x > len(state["subjects"])
+                for x in indices
+            ):
+                raise ValueError()
+
+            state["chosen"] = [
+                state["subjects"][n - 1]
+                for n in dict.fromkeys(indices)
+            ]
+        except ValueError:
+            await event.respond(
+                "Use subject numbers like 1,3,5 "
+                "or Select ALL button."
+            )
+            return
+
+        await confirm(event, state)
+        return
+
+    await event.respond(
+        "Selection ke liye inline buttons use karo."
+    )
+
+
+@tg.on(events.CallbackQuery)
+async def callback_handler(event):
+    if event.sender_id != OWNER:
+        await event.answer("Not authorized", alert=True)
+        return
+
+    state = menus.get(OWNER)
+
+    if not state:
+        await event.answer(
+            "Session expired. Send /start",
+            alert=True,
+        )
+        return
+
+    data = event.data.decode("utf-8", errors="ignore")
+
+    if data.startswith("page:"):
+        if state["step"] not in (
+            "goal", "pack", "subjects"
+        ):
+            await event.answer("Invalid menu")
+            return
+
+        field = {
+            "goal": "goals",
+            "pack": "packs",
+            "subjects": "subjects",
+        }[state["step"]]
+
+        count = len(state[field])
+        last = max(0, (count - 1) // 10)
+
+        change = (
+            1 if data == "page:next" else -1
         )
 
-    lines.append("")
-    lines.append(f"Total: {len(items)}")
-    lines.append("Number bhejo. next / prev bhi use kar sakte ho.")
+        state["page"] = max(
+            0,
+            min(last, state["page"] + change),
+        )
 
-    return "\n".join(lines)[:3900]
+        await event.answer()
+        await show_menu(event, state, edit=True)
+        return
+
+    if data.startswith("pick:"):
+        step = state["step"]
+
+        if step not in ("goal", "pack", "subjects"):
+            await event.answer("Invalid selection")
+            return
+
+        field = {
+            "goal": "goals",
+            "pack": "packs",
+            "subjects": "subjects",
+        }[step]
+
+        try:
+            index = int(data.split(":")[1])
+            item = state[field][index]
+        except (ValueError, IndexError):
+            await event.answer("Invalid index")
+            return
+
+        await event.answer()
+
+        if step == "goal":
+            state["goal"] = item
+            await event.respond("🔎 Finding packs...")
+
+            try:
+                result = await batches(PROFILE, item)
+            except Exception as error:
+                await event.respond(
+                    "Pack discovery failed:\n"
+                    + clean_error(error)
+                )
+                return
+
+            if not result:
+                await event.respond(
+                    "No packs found for this goal."
+                )
+                return
+
+            state.update({
+                "packs": result,
+                "step": "pack",
+                "page": 0,
+            })
+
+            await show_menu(event, state)
+            return
+
+        if step == "pack":
+            state["pack"] = item
+            await event.respond("🔎 Finding subjects...")
+
+            try:
+                result = await subjects(PROFILE, item)
+            except Exception as error:
+                await event.respond(
+                    "Subject discovery failed:\n"
+                    + clean_error(error)
+                )
+                return
+
+            if not result:
+                await event.respond(
+                    "No subjects in this pack."
+                )
+                return
+
+            state.update({
+                "subjects": result,
+                "step": "subjects",
+                "page": 0,
+            })
+
+            await show_menu(event, state)
+            return
+
+        if step == "subjects":
+            state["chosen"] = [item]
+            await confirm(event, state)
+            return
+
+    if data == "select:all":
+        if state["step"] != "subjects":
+            await event.answer("Invalid step")
+            return
+
+        await event.answer()
+        state["chosen"] = state["subjects"]
+        await confirm(event, state)
+        return
+
+    if data == "confirm:no":
+        menus.pop(OWNER, None)
+        await event.answer("Cancelled")
+        await event.respond(
+            "Cancelled. Send /start again."
+        )
+        return
+
+    if data == "confirm:yes":
+        if state["step"] != "confirm":
+            await event.answer("Invalid step")
+            return
+
+        payload = {
+            "goal": state["goal"],
+            "pack": state["pack"],
+            "subjects": state["chosen"],
+        }
+
+        cursor = sql.execute(
+            "INSERT INTO jobs(payload,status) "
+            "VALUES(?, 'queued')",
+            (json.dumps(payload),),
+        )
+        sql.commit()
+
+        menus.pop(OWNER, None)
+
+        await event.answer("Queued")
+        await event.respond(
+            f"✅ Job #{cursor.lastrowid} queued.\n"
+            "Use /status for progress."
+        )
+        return
+
+    await event.answer("Unknown action")
 
 
 async def process_job(job_id, payload):
     global cancel_requested
 
-    goal = payload["goal"]
-    pack = payload["pack"]
-    subjects = payload["subjects"]
-
     done = 0
     errors = 0
 
-    for subject_number, subject in enumerate(subjects, 1):
+    for subject in payload["subjects"]:
         if cancel_requested:
             break
 
         while paused and not cancel_requested:
             await asyncio.sleep(2)
 
-        status["stage"] = "Discovering classes"
-        status["subject"] = subject["name"]
-
-        await live(
-            f"🔎 Subject {subject_number}/{len(subjects)}\n"
-            f"{subject['name']}\n"
-            "Finding available classes...",
-            force=True,
-        )
+        activity["stage"] = "Discovering classes"
 
         try:
-            lessons, total = await discover_classes(
-                subject,
-                STATE / "browser_profile",
+            lectures, total = await classes(
+                PROFILE, subject
             )
         except Exception as error:
             errors += 1
-
             await notify(
-                f"❌ CLASS DISCOVERY ERROR\n"
-                f"Subject: {subject['name']}\n"
-                f"{clean_error(error)}"
+                "❌ Subject discovery failed:\n"
+                + subject["name"] + "\n"
+                + clean_error(error)
             )
             continue
 
         await notify(
             f"📚 {subject['name']}\n"
-            f"Class entries: {total}\n"
-            f"Playable links: {len(lessons)}"
+            f"Total classes: {total}\n"
+            f"Playable links: {len(lectures)}"
         )
 
-        for lecture_number, lesson in enumerate(lessons, 1):
+        for lecture in lectures:
             if cancel_requested:
                 break
 
             while paused and not cancel_requested:
                 await asyncio.sleep(2)
 
-            lecture_key = (
-                f"{goal['uid']}:"
-                f"{pack['uid']}:"
-                f"{subject['uid']}:"
-                f"{lesson['class_number']}"
+            key = (
+                payload["goal"]["uid"] + ":"
+                + payload["pack"]["uid"] + ":"
+                + subject["uid"] + ":"
+                + str(lecture["class_number"])
             )
 
-            if storage.completed(lecture_key):
+            if storage.completed(key):
                 done += 1
                 continue
 
-            status["lecture"] = lesson["title"]
-            status["stage"] = "Downloading"
+            activity["lecture"] = lecture["title"]
 
-            async def download_progress(kind, percent):
-                status["percent"] = percent
+            async def dl_progress(kind, percent):
                 await live(
                     f"📥 Downloading\n"
-                    f"Subject {subject_number}/{len(subjects)}\n"
-                    f"Lecture {lecture_number}/{len(lessons)}\n"
-                    f"{lesson['title'][:90]}\n"
-                    f"{kind}: {percent:.1f}%\n"
-                    f"Errors: {errors}"
+                    f"{lecture['title'][:80]}\n"
+                    f"{kind}: {percent:.1f}%"
                 )
 
-            async def upload_progress(filename, percent):
-                status["percent"] = percent
+            async def up_progress(filename, percent):
                 await live(
-                    f"📤 Uploading to Telegram\n"
-                    f"Batch: {subject['name'][:70]}\n"
-                    f"Class {lesson['class_number']}\n"
-                    f"File: {filename}\n"
-                    f"Progress: {percent:.1f}%\n"
-                    f"Errors: {errors}"
+                    f"📤 Uploading\n"
+                    f"{lecture['title'][:80]}\n"
+                    f"{filename}: {percent:.1f}%"
                 )
 
             try:
+                activity["stage"] = "Downloading"
+
                 await live(
-                    f"📥 Starting lecture "
-                    f"{lecture_number}/{len(lessons)}\n"
-                    f"{lesson['title']}",
+                    f"📥 Starting\n"
+                    f"{lecture['title']}",
                     force=True,
                 )
 
                 folder, manifest = await download_lecture(
+                    PROFILE,
+                    FILES,
                     subject,
-                    lesson,
-                    lecture_key,
-                    STATE / "browser_profile",
-                    DOWNLOADS,
-                    download_progress,
+                    lecture,
+                    key,
+                    dl_progress,
                 )
 
-                status["stage"] = "Uploading"
+                activity["stage"] = "Uploading"
 
-                await storage.upload_package(
-                    client,
+                await storage.upload(
+                    tg,
                     folder,
-                    lecture_key,
+                    key,
                     subject,
-                    lesson,
-                    upload_progress,
+                    lecture,
+                    up_progress,
                 )
 
                 storage.mark_complete(
-                    lecture_key,
-                    goal,
-                    pack,
+                    key,
+                    payload["goal"],
+                    payload["pack"],
                     subject,
-                    lesson,
+                    lecture,
                     manifest,
                 )
 
                 done += 1
 
                 await live(
-                    f"✅ Lecture uploaded\n"
-                    f"{lesson['title']}\n"
-                    f"Processed: {done}\n"
-                    f"Errors: {errors}",
+                    f"✅ Uploaded: {lecture['title']}\n"
+                    f"Done: {done} | Errors: {errors}",
                     force=True,
                 )
 
             except Exception as error:
                 errors += 1
-                logging.exception(
-                    "Lecture failed: %s",
-                    lecture_key,
-                )
+                logging.exception("Lecture failure")
 
                 await notify(
-                    f"🚨 LECTURE ERROR\n"
+                    f"🚨 Lecture failed\n"
                     f"Subject: {subject['name']}\n"
-                    f"Class: {lesson['class_number']}\n"
-                    f"Title: {lesson['title']}\n"
-                    f"Stage: {status['stage']}\n"
-                    f"Error: {clean_error(error)}\n\n"
-                    f"Next lecture continue hoga."
+                    f"Class: {lecture['class_number']}\n"
+                    f"Error: {clean_error(error)}"
                 )
 
             sql.execute(
-                """
-                UPDATE jobs
-                SET done=?, errors=?, stage=?
-                WHERE id=?
-                """,
-                (done, errors, status["stage"], job_id),
+                "UPDATE jobs SET done=?,errors=? WHERE id=?",
+                (done, errors, job_id),
             )
             sql.commit()
 
@@ -335,464 +705,90 @@ async def worker():
                 await asyncio.sleep(2)
                 continue
 
-            row = sql.execute("""
-                SELECT id,payload
-                FROM jobs
-                WHERE status='queued'
-                ORDER BY id
-                LIMIT 1
-            """).fetchone()
+            job = sql.execute(
+                "SELECT id,payload FROM jobs "
+                "WHERE status='queued' "
+                "ORDER BY id LIMIT 1"
+            ).fetchone()
 
-            if not row:
+            if not job:
                 await asyncio.sleep(3)
                 continue
 
-            job_id, payload_json = row
+            job_id, raw = job
             cancel_requested = False
 
             sql.execute(
-                """
-                UPDATE jobs
-                SET status='running', stage='Starting'
-                WHERE id=?
-                """,
+                "UPDATE jobs SET status='running' "
+                "WHERE id=?",
                 (job_id,),
             )
             sql.commit()
 
             try:
                 done, errors = await process_job(
-                    job_id,
-                    json.loads(payload_json),
+                    job_id, json.loads(raw)
                 )
 
-                final_state = (
-                    "cancelled"
-                    if cancel_requested
-                    else "completed_with_errors"
-                    if errors
+                result = (
+                    "cancelled" if cancel_requested
+                    else "completed_with_errors" if errors
                     else "completed"
                 )
 
                 sql.execute(
-                    """
-                    UPDATE jobs
-                    SET status=?,stage=?
-                    WHERE id=?
-                    """,
-                    (final_state, final_state, job_id),
+                    "UPDATE jobs SET status=? WHERE id=?",
+                    (result, job_id),
                 )
                 sql.commit()
 
                 await notify(
-                    f"🏁 JOB #{job_id} FINISHED\n"
-                    f"Processed: {done}\n"
-                    f"Errors: {errors}\n"
-                    f"Status: {final_state}"
+                    f"🏁 Job #{job_id}\n"
+                    f"Done: {done}\nErrors: {errors}\n"
+                    f"Status: {result}"
                 )
 
             except Exception as error:
-                logging.exception("Job failed")
+                logging.exception("Job error")
 
                 sql.execute(
-                    """
-                    UPDATE jobs
-                    SET status='failed',stage='Failed'
-                    WHERE id=?
-                    """,
+                    "UPDATE jobs SET status='failed' "
+                    "WHERE id=?",
                     (job_id,),
                 )
                 sql.commit()
 
                 await notify(
-                    f"🚨 JOB #{job_id} FAILED\n"
-                    f"{clean_error(error)}"
+                    f"🚨 Job #{job_id} failed\n"
+                    + clean_error(error)
                 )
 
-            status["stage"] = "Idle"
+            activity["stage"] = "Idle"
 
         except asyncio.CancelledError:
             raise
-
         except Exception:
-            logging.exception("Worker loop error")
+            logging.exception("Worker crash")
             await asyncio.sleep(5)
 
 
-@client.on(events.NewMessage(incoming=True))
-async def handler(event):
-    global paused, cancel_requested
-
-    if not event.is_private:
-        return
-
-    if event.sender_id != OWNER_ID:
-        return
-
-    text = event.raw_text.strip()
-    lower = text.lower()
-
-    if lower == "/status":
-        rows = sql.execute("""
-            SELECT id,status,done,errors,stage
-            FROM jobs
-            ORDER BY id DESC
-            LIMIT 5
-        """).fetchall()
-
-        lines = [
-            f"Stage: {status['stage']}",
-            f"Subject: {status['subject']}",
-            f"Lecture: {status['lecture']}",
-            f"Progress: {status['percent']:.1f}%",
-            f"Paused: {paused}",
-            "",
-        ]
-
-        for item in rows:
-            lines.append(
-                f"#{item[0]} {item[1]} "
-                f"| Done={item[2]} Errors={item[3]} "
-                f"| {item[4]}"
-            )
-
-        await event.reply("\n".join(lines)[:3900])
-        return
-
-    if lower == "/pause":
-        paused = True
-        await event.reply(
-            "⏸ Queue paused after current operation."
-        )
-        return
-
-    if lower == "/resume":
-        paused = False
-        await event.reply("▶️ Queue resumed.")
-        return
-
-    if lower == "/cancel":
-        cancel_requested = True
-        await event.reply(
-            "🛑 Cancellation requested."
-        )
-        return
-
-    if lower == "/retry":
-        row = sql.execute("""
-            SELECT id FROM jobs
-            WHERE status IN ('failed','completed_with_errors')
-            ORDER BY id DESC LIMIT 1
-        """).fetchone()
-
-        if row:
-            sql.execute(
-                """
-                UPDATE jobs
-                SET status='queued',stage='Retrying'
-                WHERE id=?
-                """,
-                (row[0],),
-            )
-            sql.commit()
-
-            await event.reply(
-                f"♻️ Job #{row[0]} queued again."
-            )
-        else:
-            await event.reply(
-                "No failed job available."
-            )
-        return
-
-    if lower in ("/start", "/search"):
-        menus[event.sender_id] = {
-            "step": "category",
-            "page": 0,
-        }
-
-        await event.reply(
-            "🤖 Lecture Manager\n\n"
-            "Apni category likho:\n"
-            "Example: CA / Chartered Accountant / UPSC\n\n"
-            "Commands: /status /pause /resume /cancel /retry"
-        )
-        return
-
-    state = menus.get(event.sender_id)
-
-    if not state:
-        await event.reply(
-            "Start karne ke liye /start bhejo."
-        )
-        return
-
-    step = state["step"]
-
-    if lower in ("next", "prev") and step in (
-        "goal", "batch", "subjects"
-    ):
-        field = {
-            "goal": "goals",
-            "batch": "batches",
-            "subjects": "subjects",
-        }[step]
-
-        max_page = max(
-            0,
-            (len(state[field]) - 1) // 20,
-        )
-
-        state["page"] = max(
-            0,
-            min(
-                max_page,
-                state["page"] + (
-                    1 if lower == "next" else -1
-                ),
-            ),
-        )
-
-        await event.reply(
-            numbered(
-                state[field],
-                f"Select {step}:",
-                state["page"],
-            )
-        )
-        return
-
-    if step == "category":
-        await event.reply(
-            f"🔎 Searching category: {text}"
-        )
-
-        try:
-            goals = await discover_goals(
-                text,
-                STATE / "browser_profile",
-            )
-        except Exception as error:
-            await event.reply(
-                "Goal search failed:\n"
-                + clean_error(error)
-            )
-            return
-
-        if not goals:
-            await event.reply(
-                "No matching goals found. "
-                "Try another keyword."
-            )
-            return
-
-        state.update({
-            "step": "goal",
-            "goals": goals,
-            "page": 0,
-        })
-
-        await event.reply(
-            numbered(
-                goals,
-                "🎯 Goal number select karo:",
-            )
-        )
-        return
-
-    if step == "goal":
-        if not text.isdigit() or not (
-            1 <= int(text) <= len(state["goals"])
-        ):
-            await event.reply(
-                "Valid goal index bhejo."
-            )
-            return
-
-        goal = state["goals"][int(text) - 1]
-
-        await event.reply(
-            "🔎 Finding batches and packs..."
-        )
-
-        try:
-            batches = await discover_batches(
-                goal,
-                STATE / "browser_profile",
-            )
-        except Exception as error:
-            await event.reply(
-                "Batch search error:\n"
-                + clean_error(error)
-            )
-            return
-
-        if not batches:
-            await event.reply(
-                "No batches found for this goal."
-            )
-            return
-
-        state.update({
-            "step": "batch",
-            "goal": goal,
-            "batches": batches,
-            "page": 0,
-        })
-
-        await event.reply(
-            numbered(
-                batches,
-                "📦 Batch/pack number select karo:",
-            )
-        )
-        return
-
-    if step == "batch":
-        if not text.isdigit() or not (
-            1 <= int(text) <= len(state["batches"])
-        ):
-            await event.reply(
-                "Valid batch number bhejo."
-            )
-            return
-
-        pack = state["batches"][int(text) - 1]
-
-        await event.reply(
-            "🔎 Finding subjects..."
-        )
-
-        try:
-            subjects = await discover_subjects(
-                pack,
-                STATE / "browser_profile",
-            )
-        except Exception as error:
-            await event.reply(
-                "Subject discovery error:\n"
-                + clean_error(error)
-            )
-            return
-
-        if not subjects:
-            await event.reply(
-                "No subjects found."
-            )
-            return
-
-        state.update({
-            "step": "subjects",
-            "pack": pack,
-            "subjects": subjects,
-            "page": 0,
-        })
-
-        await event.reply(
-            numbered(
-                subjects,
-                "📚 Subjects select karo:\n"
-                "all / 2 / 1,3,5",
-            )
-        )
-        return
-
-    if step == "subjects":
-        if lower == "all":
-            selected = state["subjects"]
-        else:
-            try:
-                numbers = [
-                    int(part.strip())
-                    for part in text.split(",")
-                ]
-
-                if not numbers or any(
-                    n < 1 or n > len(state["subjects"])
-                    for n in numbers
-                ):
-                    raise ValueError()
-
-                selected = [
-                    state["subjects"][n - 1]
-                    for n in dict.fromkeys(numbers)
-                ]
-
-            except Exception:
-                await event.reply(
-                    "Use all or numbers like 1,3,5."
-                )
-                return
-
-        state.update({
-            "step": "confirm",
-            "selected": selected,
-        })
-
-        await event.reply(
-            "📋 DOWNLOAD CONFIRMATION\n\n"
-            f"Goal: {state['goal']['name']}\n"
-            f"Pack: {state['pack']['name']}\n"
-            f"Subjects: {len(selected)}\n\n"
-            "YES = Download and Upload\n"
-            "NO = Cancel"
-        )
-        return
-
-    if step == "confirm":
-        if lower != "yes":
-            menus.pop(event.sender_id, None)
-            await event.reply(
-                "Cancelled. /start se dobara shuru karo."
-            )
-            return
-
-        payload = {
-            "goal": state["goal"],
-            "pack": state["pack"],
-            "subjects": state["selected"],
-        }
-
-        cursor = sql.execute(
-            """
-            INSERT INTO jobs(payload,status,stage)
-            VALUES(?, 'queued', 'Queued')
-            """,
-            (json.dumps(payload),),
-        )
-        sql.commit()
-
-        menus.pop(event.sender_id, None)
-
-        await event.reply(
-            f"✅ Job #{cursor.lastrowid} queued.\n"
-            "Live progress aur errors isi DM mein aayenge.\n"
-            "Check: /status"
-        )
-
-
 async def main():
-    await client.start(
-        bot_token=os.environ["BOT_TOKEN"]
-    )
+    await tg.start(bot_token=os.environ["BOT_TOKEN"])
 
     await notify(
-        "✅ Lecture Manager started.\n"
-        "Send /start to begin."
+        "✅ Lecture Manager started\n"
+        "Send /start"
     )
 
     task = asyncio.create_task(worker())
 
     try:
-        await client.run_until_disconnected()
+        await tg.run_until_disconnected()
     finally:
         task.cancel()
-
         await asyncio.gather(
-            task,
-            return_exceptions=True,
+            task, return_exceptions=True
         )
-
         sql.close()
         storage.close()
 

@@ -1,8 +1,8 @@
 import os
 import asyncio
 import time
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 
 import aiohttp
 from pymongo import MongoClient, ASCENDING
@@ -10,19 +10,19 @@ from pymongo import MongoClient, ASCENDING
 
 class Storage:
     def __init__(self):
-        uri = os.environ["MONGODB_URI"]
-        name = os.getenv("MONGODB_DB", "lecture_storage")
-
         self.group_id = int(os.environ["STORAGE_GROUP_ID"])
         self.bot_token = os.environ["BOT_TOKEN"]
 
-        self.mongo = MongoClient(
-            uri,
+        self.client = MongoClient(
+            os.environ["MONGODB_URI"],
             serverSelectionTimeoutMS=12000,
         )
-        self.mongo.admin.command("ping")
 
-        self.db = self.mongo[name]
+        self.client.admin.command("ping")
+
+        self.db = self.client[
+            os.getenv("MONGODB_DB", "lecture_storage")
+        ]
 
         self.db.lecture_topics.create_index(
             [
@@ -41,82 +41,16 @@ class Storage:
         )
 
         self.db.lecture_records.create_index(
-            "lecture_key",
-            unique=True,
+            "lecture_key", unique=True
         )
 
-    def existing_file(self, lecture_key, filename):
-        return self.db.lecture_files.find_one({
-            "lecture_key": lecture_key,
-            "filename": filename,
-        })
-
-    def completed(self, lecture_key):
-        return self.db.lecture_records.find_one({
-            "lecture_key": lecture_key,
+    def completed(self, key):
+        return bool(self.db.lecture_records.find_one({
+            "lecture_key": key,
             "status": "uploaded",
-        }) is not None
+        }))
 
-    def save_file(
-        self,
-        lecture_key,
-        subject,
-        lesson,
-        thread_id,
-        message_id,
-        path,
-    ):
-        filename = Path(path).name
-
-        self.db.lecture_files.update_one(
-            {
-                "lecture_key": lecture_key,
-                "filename": filename,
-            },
-            {
-                "$set": {
-                    "lecture_key": lecture_key,
-                    "filename": filename,
-                    "group_id": self.group_id,
-                    "thread_id": thread_id,
-                    "message_id": message_id,
-                    "batch_uid": subject["uid"],
-                    "class_number": lesson["class_number"],
-                    "size": Path(path).stat().st_size,
-                    "uploaded_at": datetime.now(timezone.utc),
-                }
-            },
-            upsert=True,
-        )
-
-    def mark_complete(
-        self,
-        lecture_key,
-        goal,
-        pack,
-        subject,
-        lesson,
-        manifest,
-    ):
-        self.db.lecture_records.update_one(
-            {"lecture_key": lecture_key},
-            {
-                "$set": {
-                    "lecture_key": lecture_key,
-                    "goal_uid": goal["uid"],
-                    "pack_uid": pack["uid"],
-                    "batch_uid": subject["uid"],
-                    "class_number": lesson["class_number"],
-                    "title": lesson["title"],
-                    "manifest": manifest,
-                    "status": "uploaded",
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            },
-            upsert=True,
-        )
-
-    async def get_topic(self, subject):
+    async def topic(self, subject):
         existing = self.db.lecture_topics.find_one({
             "group_id": self.group_id,
             "batch_uid": subject["uid"],
@@ -137,47 +71,38 @@ class Storage:
                     "chat_id": self.group_id,
                     "name": subject["name"][:128],
                 },
-                timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
-                data = await response.json()
+                result = await response.json()
 
-        if not data.get("ok"):
+        if not result.get("ok"):
             raise RuntimeError(
-                "Telegram topic creation failed: "
-                + str(data.get("description", "unknown error"))
+                "Topic creation failed: "
+                + str(result.get("description", "unknown"))
             )
 
-        thread_id = data["result"]["message_thread_id"]
+        thread_id = result["result"]["message_thread_id"]
 
         self.db.lecture_topics.update_one(
             {
                 "group_id": self.group_id,
                 "batch_uid": subject["uid"],
             },
-            {
-                "$set": {
-                    "group_id": self.group_id,
-                    "batch_uid": subject["uid"],
-                    "name": subject["name"],
-                    "thread_id": thread_id,
-                }
-            },
+            {"$set": {
+                "group_id": self.group_id,
+                "batch_uid": subject["uid"],
+                "thread_id": thread_id,
+                "name": subject["name"],
+            }},
             upsert=True,
         )
 
         return thread_id
 
-    async def upload_package(
-        self,
-        client,
-        folder,
-        lecture_key,
-        subject,
-        lesson,
-        progress=None,
+    async def upload(
+        self, telegram, folder, key,
+        subject, lecture, on_progress=None,
     ):
         folder = Path(folder)
-        thread_id = await self.get_topic(subject)
 
         video = next(
             (
@@ -187,72 +112,107 @@ class Storage:
             None,
         )
 
-        if video is None:
-            raise RuntimeError("Video file missing")
+        if not video:
+            raise RuntimeError("Video missing")
 
-        files = [
-            folder / "board.json",
-            folder / "manifest.json",
-            folder / "slides.zip",
-            video,
+        filenames = [
+            "board.json",
+            "slides.zip",
+            "manifest.json",
+            video.name,
         ]
 
-        for file in files:
-            if not file.is_file():
-                raise RuntimeError(
-                    f"Package file missing: {file.name}"
-                )
+        thread_id = await self.topic(subject)
 
-            if self.existing_file(
-                lecture_key,
-                file.name,
-            ):
+        for filename in filenames:
+            old = self.db.lecture_files.find_one({
+                "lecture_key": key,
+                "filename": filename,
+            })
+
+            if old:
                 continue
 
-            last_update = [0]
+            path = folder / filename
+
+            if not path.is_file():
+                raise RuntimeError(
+                    "Missing file: " + filename
+                )
+
+            last_update = [0.0]
 
             def callback(sent, total):
-                if not progress or not total:
+                now = time.monotonic()
+
+                if not on_progress or not total:
                     return
 
-                current = time.monotonic()
-
                 if (
-                    current - last_update[0] < 6
-                    and sent != total
+                    sent != total
+                    and now - last_update[0] < 6
                 ):
                     return
 
-                last_update[0] = current
+                last_update[0] = now
 
                 asyncio.create_task(
-                    progress(
-                        file.name,
+                    on_progress(
+                        filename,
                         sent * 100 / total,
                     )
                 )
 
-            message = await client.send_file(
+            message = await telegram.send_file(
                 self.group_id,
-                str(file),
+                str(path),
                 caption=(
-                    f"Class {lesson['class_number']}\n"
-                    f"{lesson['title']}\n"
-                    f"{file.name}"
+                    f"Class {lecture['class_number']}\n"
+                    f"{lecture['title']}\n{filename}"
                 )[:1024],
                 reply_to=thread_id,
                 force_document=True,
                 progress_callback=callback,
             )
 
-            self.save_file(
-                lecture_key,
-                subject,
-                lesson,
-                thread_id,
-                message.id,
-                file,
+            self.db.lecture_files.update_one(
+                {
+                    "lecture_key": key,
+                    "filename": filename,
+                },
+                {"$set": {
+                    "lecture_key": key,
+                    "filename": filename,
+                    "batch_uid": subject["uid"],
+                    "class_number": lecture["class_number"],
+                    "group_id": self.group_id,
+                    "thread_id": thread_id,
+                    "message_id": message.id,
+                    "size": path.stat().st_size,
+                    "uploaded_at": datetime.now(timezone.utc),
+                }},
+                upsert=True,
             )
 
+    def mark_complete(
+        self, key, goal, pack, subject,
+        lecture, manifest,
+    ):
+        self.db.lecture_records.update_one(
+            {"lecture_key": key},
+            {"$set": {
+                "lecture_key": key,
+                "goal_uid": goal["uid"],
+                "pack_uid": pack["uid"],
+                "batch_uid": subject["uid"],
+                "class_number": lecture["class_number"],
+                "title": lecture["title"],
+                "manifest": manifest,
+                "status": "uploaded",
+                "updated_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+
     def close(self):
-        self.mongo.close()
+        self.client.close()

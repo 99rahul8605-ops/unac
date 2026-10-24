@@ -1,23 +1,23 @@
 import re
+import asyncio
+from pathlib import Path
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 BASE = "https://unacademy.hrvertex.workers.dev"
-
-KNOWN_GOALS = [
-    {
-        "uid": "RXRWJ",
-        "name": "CA Intermediate",
-        "url": BASE + "/goal/RXRWJ",
-    }
-]
+GENERIC = re.compile(
+    r"^(view classes|view details|view batch|"
+    r"view pack|explore|learn more|open|watch|"
+    r"join|enroll|details|back)$",
+    re.I,
+)
 
 
-def uid(url):
+def identifier(url):
     return urlparse(url).path.rstrip("/").split("/")[-1]
 
 
-async def open_browser(profile):
+async def start_browser(profile):
     pw = await async_playwright().start()
     try:
         context = await pw.chromium.launch_persistent_context(
@@ -31,276 +31,359 @@ async def open_browser(profile):
         raise
 
 
-async def close_browser(pw, context):
+async def stop_browser(pw, context):
     await context.close()
     await pw.stop()
 
 
-async def navigate(page, url):
+async def load(page, url):
     await page.goto(
         url,
         wait_until="domcontentloaded",
         timeout=90000,
     )
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(3500)
+
+    if await page.get_by_text(
+        "Verify you're human", exact=False
+    ).count():
+        raise RuntimeError(
+            "Website verification required. "
+            "Open with your authorized browser session."
+        )
 
 
-async def read_links(page):
-    return await page.locator("a[href]").evaluate_all("""
-    anchors => anchors.map(a => ({
-        name: (a.innerText || a.getAttribute("aria-label") || "")
-            .split("\\n").map(x => x.trim()).find(Boolean) || "",
-        url: a.href,
-        path: new URL(a.href).pathname
-    }))
-    """)
+async def collect_links(page, route):
+    return await page.evaluate(
+        r"""route => {
+          const found = new Map();
+          const pattern = new RegExp(
+            '^/(' + route + ')/([^/]+)/?$'
+          );
+
+          for (const a of document.querySelectorAll('a[href]')) {
+            const u = new URL(a.href);
+            if (u.origin !== location.origin) continue;
+
+            const match = u.pathname.match(pattern);
+            if (!match) continue;
+
+            const title = (a.innerText || '')
+              .trim().replace(/\s+/g, ' ');
+
+            const generic = /^(view classes|view details|view batch|view pack|explore|learn more|open|watch|join|enroll|details|back)$/i;
+            const valid = title.length >= 4 &&
+              title.length <= 170 && !generic.test(title);
+
+            const key = match[1] + ':' + match[2];
+
+            // Crucial: a generic action link can never
+            // replace a valid title link.
+            const existing = found.get(key);
+            if (!existing || (valid && !existing.valid)) {
+              found.set(key, {
+                uid: match[2],
+                type: match[1],
+                name: valid ? title : '',
+                url: u.origin + u.pathname,
+                valid: valid
+              });
+            }
+          }
+
+          return [...found.values()];
+        }""",
+        route,
+    )
 
 
-def filter_links(rows, pattern):
-    items = {}
-
-    for row in rows:
-        url = row.get("url", "")
-        path = row.get("path", "")
-
-        if urlparse(url).netloc != urlparse(BASE).netloc:
-            continue
-
-        if not re.fullmatch(pattern, path):
-            continue
-
-        items[path] = {
-            "uid": uid(url),
-            "name": row.get("name") or path,
-            "url": BASE + path,
+def normalize(rows):
+    return [
+        {
+            "uid": x["uid"],
+            "type": x["type"],
+            "name": x["name"] or (
+                x["type"].title() + " — " + x["uid"]
+            ),
+            "url": x["url"],
         }
+        for x in rows
+    ]
 
-    return list(items.values())
 
+async def goals(profile, keyword):
+    pw, context = await start_browser(profile)
 
-async def discover_goals(keyword, profile):
-    pw, context = await open_browser(profile)
     try:
         page = context.pages[0] if context.pages else await context.new_page()
-        await navigate(page, BASE + "/")
 
-        inputs = page.locator(
-            'input[type="search"], input[placeholder*="Search" i]'
+        # This is the actual goal selection page.
+        await load(page, BASE + "/?change=1")
+
+        term = keyword.strip()
+        ca_search = term.lower() in {
+            "ca", "chartered accountant",
+            "chartered accountants", "commerce",
+        }
+
+        # On the goal selector, categories expand goals.
+        # Expand CA category for CA-related searches.
+        if ca_search:
+            category = page.get_by_text(
+                "CA, CS & Commerce", exact=False
+            ).first
+            try:
+                await category.click(timeout=5000)
+                await page.wait_for_timeout(1800)
+            except Exception:
+                pass
+
+        search = page.locator(
+            'input[placeholder*="Search for your goal" i]'
+        ).first
+
+        try:
+            if await search.is_visible():
+                await search.fill(
+                    "CA" if ca_search else term
+                )
+                await page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        rows = normalize(
+            await collect_links(page, "goal")
         )
 
-        if await inputs.count():
-            await inputs.first.fill(keyword)
-            await page.wait_for_timeout(1800)
-
-        results = filter_links(
-            await read_links(page),
-            r"/goal/[^/]+",
-        )
-
-        for known in KNOWN_GOALS:
-            if known["uid"] not in {x["uid"] for x in results}:
-                results.append(known)
-
-        term = keyword.strip().lower()
-
-        if term in ("ca", "chartered accountant", "chartered accountants"):
+        if ca_search:
             return [
-                x for x in results
-                if x["name"].lower().startswith("ca ")
-                or "chartered" in x["name"].lower()
+                x for x in rows
+                if re.search(
+                    r"\bCA\b|Chartered Accountant",
+                    x["name"],
+                    re.I,
+                )
             ]
 
         return [
-            x for x in results
-            if term in x["name"].lower()
+            x for x in rows
+            if term.lower() in x["name"].lower()
         ]
+
     finally:
-        await close_browser(pw, context)
+        await stop_browser(pw, context)
 
 
-async def discover_batches(goal, profile):
-    pw, context = await open_browser(profile)
+async def batches(profile, goal):
+    pw, context = await start_browser(profile)
+
     try:
         page = context.pages[0] if context.pages else await context.new_page()
-        await navigate(page, goal["url"] + "?tab=batch")
+        await load(page, goal["url"] + "?tab=batch")
+
+        # Some versions default to educators.
+        batch_tab = page.get_by_role(
+            "button", name="Batches", exact=True
+        )
+
+        try:
+            if await batch_tab.is_visible():
+                await batch_tab.click(timeout=5000)
+                await page.wait_for_timeout(1400)
+        except Exception:
+            pass
 
         found = {}
-        unchanged = 0
+        stable = 0
 
-        for _ in range(20):
+        for _ in range(50):
+            entries = normalize(
+                await collect_links(page, "pack|batch")
+            )
+
             before = len(found)
 
-            for entry in filter_links(
-                await read_links(page),
-                r"/(?:pack|batch)/[^/]+",
-            ):
-                found[entry["url"]] = entry
+            for x in entries:
+                key = x["type"] + ":" + x["uid"]
+
+                old = found.get(key)
+
+                if (
+                    not old
+                    or old["name"].endswith(" — " + x["uid"])
+                ):
+                    found[key] = x
 
             if len(found) == before:
-                unchanged += 1
+                stable += 1
             else:
-                unchanged = 0
+                stable = 0
 
             more = page.get_by_role(
                 "button",
                 name=re.compile(
-                    r"load more|show more|view more|next",
+                    r"load more|show more|view more",
                     re.I,
                 ),
             ).first
 
-            try:
-                if not await more.is_visible():
-                    break
-                await more.click(timeout=6000)
-                await page.wait_for_timeout(1400)
-            except Exception:
-                break
+            clicked = False
 
-            if unchanged >= 3:
+            try:
+                if await more.is_visible():
+                    await more.click(timeout=5000)
+                    clicked = True
+            except Exception:
+                pass
+
+            if not clicked:
+                await page.evaluate(
+                    "() => window.scrollTo(0, document.body.scrollHeight)"
+                )
+
+            await page.wait_for_timeout(900)
+
+            if stable >= 5:
                 break
 
         return list(found.values())
+
     finally:
-        await close_browser(pw, context)
+        await stop_browser(pw, context)
 
 
-async def discover_subjects(pack, profile):
-    if "/batch/" in pack["url"]:
+async def subjects(profile, pack):
+    if pack["type"] == "batch":
         return [pack]
 
-    pw, context = await open_browser(profile)
+    pw, context = await start_browser(profile)
+
     try:
         page = context.pages[0] if context.pages else await context.new_page()
-        await navigate(page, pack["url"])
+        await load(page, pack["url"])
 
-        return filter_links(
-            await read_links(page),
-            r"/batch/[^/]+",
+        return normalize(
+            await collect_links(page, "batch")
         )
+
     finally:
-        await close_browser(pw, context)
+        await stop_browser(pw, context)
 
 
-CLASS_EXTRACTOR = r"""
+CLASS_JS = r"""
 () => {
-    const body = document.body.innerText || "";
-    const count = body.match(
-        /(\d+)\s+classes total\s*[·•]\s*Showing\s+(\d+)/i
-    );
+  const text = document.body.innerText || '';
+  const m = text.match(
+    /(\d+)\s+classes total\s*[·•]\s*Showing\s+(\d+)/i
+  );
 
-    const classes = [];
+  const classes = [];
 
-    for (const link of document.querySelectorAll("a[href]")) {
-        if (new URL(link.href).pathname !== "/watch") continue;
+  for (const a of document.querySelectorAll('a[href]')) {
+    if (new URL(a.href).pathname !== '/watch') continue;
 
-        let node = link.parentElement;
-        let card = null;
+    let card = a.parentElement;
+    let match = null;
 
-        for (let depth = 0; depth < 12 && node; depth++, node = node.parentElement) {
-            const t = node.innerText || "";
+    for (let i = 0; i < 12 && card; i++) {
+      const t = card.innerText || '';
+      match = t.match(/Class\s+(\d+)/i);
 
-            if (/Class\s+\d+\s*[·•-]/i.test(t) && t.length < 1400) {
-                card = node;
-                break;
-            }
-        }
-
-        if (!card) continue;
-
-        const text = card.innerText || "";
-        const classMatch = text.match(/Class\s+(\d+)/i);
-
-        if (!classMatch) continue;
-
-        const lines = text.split("\n").map(x => x.trim()).filter(Boolean);
-
-        const title = lines.find(x =>
-            !/^Class\s+\d+/i.test(x) &&
-            !/^Watch class$/i.test(x) &&
-            !/^Download /i.test(x) &&
-            !/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(x)
-        ) || "Lecture";
-
-        const pdfs = [...card.querySelectorAll("a[href]")]
-            .filter(a =>
-                new URL(a.href).pathname.startsWith("/api/public/d/")
-            );
-
-        classes.push({
-            class_number: Number(classMatch[1]),
-            title: title,
-            watch_url: link.href,
-            annotated_pdf: pdfs.find(
-                a => /annotated/i.test(a.innerText)
-            )?.href || null,
-            plain_pdf: pdfs.find(
-                a => /plain/i.test(a.innerText)
-            )?.href || null
-        });
+      if (match && t.length < 1400) break;
+      card = card.parentElement;
     }
 
-    return {
-        total: count ? Number(count[1]) : null,
-        showing: count ? Number(count[2]) : null,
-        classes
-    };
+    if (!match || !card) continue;
+
+    const number = Number(match[1]);
+    const lines = (card.innerText || '')
+      .split('\n').map(x => x.trim()).filter(Boolean);
+
+    const title = lines.find(x =>
+      !/^Class\s+\d+/i.test(x) &&
+      !/^Watch class$/i.test(x) &&
+      !/^Download /i.test(x) &&
+      x.length > 3
+    ) || 'Class ' + number;
+
+    const pdfs = [...card.querySelectorAll('a[href]')]
+      .filter(x => new URL(x.href).pathname.startsWith('/api/public/d/'));
+
+    classes.push({
+      class_number: number,
+      title: title,
+      watch_url: a.href,
+      annotated_pdf: pdfs.find(
+        x => /annotated/i.test(x.innerText)
+      )?.href || null,
+      plain_pdf: pdfs.find(
+        x => /plain/i.test(x.innerText)
+      )?.href || null
+    });
+  }
+
+  return {
+    total: m ? Number(m[1]) : null,
+    showing: m ? Number(m[2]) : null,
+    classes
+  };
 }
 """
 
 
-async def discover_classes(subject, profile):
-    pw, context = await open_browser(profile)
+async def classes(profile, subject):
+    pw, context = await start_browser(profile)
 
     try:
         page = context.pages[0] if context.pages else await context.new_page()
-        await navigate(page, subject["url"])
+        await load(page, subject["url"])
 
         found = {}
-        max_showing = 0
-        expected = None
+        previous_showing = -1
+        stagnant = 0
 
-        for attempt in range(25):
-            result = await page.evaluate(CLASS_EXTRACTOR)
+        for _ in range(40):
+            result = await page.evaluate(CLASS_JS)
 
             if result["total"] is None:
                 raise RuntimeError(
-                    "Batch page did not show a valid class count."
+                    "Class count not found on page."
                 )
 
-            expected = result["total"]
-            max_showing = max(max_showing, result["showing"])
+            for x in result["classes"]:
+                found[x["class_number"]] = x
 
-            for lecture in result["classes"]:
-                found[lecture["class_number"]] = lecture
+            if result["showing"] >= result["total"]:
+                return [
+                    found[k] for k in sorted(found)
+                ], result["total"]
 
-            if max_showing >= expected:
-                return (
-                    [found[k] for k in sorted(found)],
-                    expected,
-                )
+            if result["showing"] <= previous_showing:
+                stagnant += 1
+            else:
+                stagnant = 0
+
+            previous_showing = result["showing"]
+
+            if stagnant >= 4:
+                break
 
             button = page.get_by_role(
                 "button",
-                name=re.compile(r"load more classes", re.I),
+                name=re.compile("load more classes", re.I),
             ).first
 
             try:
-                if not await button.is_visible():
-                    raise RuntimeError(
-                        f"Load More missing at {max_showing}/{expected}"
-                    )
-
                 await button.click(timeout=6000)
             except Exception:
-                await page.wait_for_timeout(1500)
+                pass
 
-            await page.wait_for_timeout(1400)
+            await page.wait_for_timeout(1300)
 
         raise RuntimeError(
-            f"Incomplete class list: {max_showing}/{expected}. "
-            "No upload job started for this subject."
+            "Incomplete class pagination; refusing to "
+            "mark this subject complete."
         )
 
     finally:
-        await close_browser(pw, context)
+        await stop_browser(pw, context)

@@ -1,82 +1,82 @@
-import re
-import json
 import asyncio
-import zipfile
 import hashlib
+import json
+import re
+import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
 
-from catalog import BASE, open_browser, close_browser, navigate
+from catalog import (
+    BASE, start_browser, stop_browser, load
+)
 
 
-def find_board_assets(data):
-    urls = set()
+def walk_urls(value):
+    found = set()
 
-    def walk(value, depth=0):
+    def walk(x, depth=0):
         if depth > 50:
             return
 
-        if isinstance(value, list):
-            for item in value:
+        if isinstance(x, list):
+            for item in x:
                 walk(item, depth + 1)
 
-        elif isinstance(value, dict):
-            url = value.get("u")
+        elif isinstance(x, dict):
+            url = x.get("u")
 
             if isinstance(url, str) and url.startswith("https://"):
-                urls.add(url)
+                found.add(url)
 
-            for item in value.values():
+            for item in x.values():
                 walk(item, depth + 1)
 
-    walk(data)
-    return sorted(urls)
+    walk(value)
+    return sorted(found)
 
 
-def board_event_count(data):
+def count_board_events(value):
     count = 0
 
-    def walk(value, depth=0):
+    def walk(x, depth=0):
         nonlocal count
 
         if depth > 50:
             return
 
-        if isinstance(value, list):
-            for item in value:
+        if isinstance(x, list):
+            for item in x:
                 walk(item, depth + 1)
 
-        elif isinstance(value, dict):
-            if "plugin" in value and "p_time" in value:
+        elif isinstance(x, dict):
+            if "plugin" in x and "p_time" in x:
                 count += 1
 
-            for item in value.values():
+            for item in x.values():
                 walk(item, depth + 1)
 
-    walk(data)
+    walk(value)
     return count
 
 
-async def fetch_video(url, target, headers, progress=None):
+async def download_video(url, target, headers, progress):
+    partial = Path(str(target) + ".part")
+
     if target.exists() and target.stat().st_size > 0:
         return
 
-    part = Path(str(target) + ".part")
-
     timeout = aiohttp.ClientTimeout(
-        total=None,
-        sock_connect=60,
-        sock_read=180,
+        total=None, sock_connect=60, sock_read=180
     )
 
     for attempt in range(3):
-        offset = part.stat().st_size if part.exists() else 0
+        start = partial.stat().st_size if partial.exists() else 0
         h = dict(headers)
 
-        if offset:
-            h["Range"] = f"bytes={offset}-"
+        if start:
+            h["Range"] = f"bytes={start}-"
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -86,69 +86,56 @@ async def fetch_video(url, target, headers, progress=None):
                             f"Video HTTP {response.status}"
                         )
 
-                    append = (
-                        offset > 0 and response.status == 206
-                    )
-
-                    start = offset if append else 0
-
-                    content_range = response.headers.get(
-                        "Content-Range", ""
-                    )
-
-                    match = re.search(r"/(\d+)$", content_range)
+                    append = start > 0 and response.status == 206
+                    offset = start if append else 0
 
                     length = response.headers.get("Content-Length")
+                    cr = response.headers.get("Content-Range", "")
+                    m = re.search(r"/(\d+)$", cr)
 
                     expected = (
-                        int(match.group(1))
-                        if match else
-                        start + int(length)
-                        if length else None
+                        int(m.group(1)) if m
+                        else offset + int(length) if length
+                        else None
                     )
 
-                    received = start
+                    received = offset
 
-                    with open(part, "ab" if append else "wb") as output:
+                    with open(
+                        partial, "ab" if append else "wb"
+                    ) as output:
                         async for chunk in response.content.iter_chunked(262144):
                             output.write(chunk)
                             received += len(chunk)
 
-                            if progress and expected:
+                            if expected and progress:
                                 await progress(
-                                    "video",
+                                    "Video",
                                     received * 100 / expected,
                                 )
 
-            if expected and part.stat().st_size != expected:
+            if expected and partial.stat().st_size != expected:
                 raise RuntimeError("Incomplete video download")
 
-            part.rename(target)
+            partial.replace(target)
             return
 
         except Exception:
             if attempt == 2:
                 raise
-
             await asyncio.sleep(3)
 
 
 async def download_lecture(
-    subject,
-    lesson,
-    lecture_key,
-    profile,
-    download_root,
-    progress=None,
+    profile, root, subject, lecture, key, progress=None
 ):
-    folder_name = hashlib.sha256(
-        lecture_key.encode()
+    folder = Path(root) / hashlib.sha256(
+        key.encode()
     ).hexdigest()[:20]
 
-    folder = Path(download_root) / folder_name
     folder.mkdir(parents=True, exist_ok=True)
 
-    pw, context = await open_browser(profile)
+    pw, context = await start_browser(profile)
 
     try:
         page = context.pages[0] if context.pages else await context.new_page()
@@ -157,20 +144,19 @@ async def download_lecture(
         board = None
         pending = []
 
-        def on_response(response):
+        def received(response):
             nonlocal video_url, board
 
             url = response.url
 
             if (
                 "/api/public/v/" in url
-                or re.search(r"\.(?:webm|mp4)(?:\?|$)", url, re.I)
+                or re.search(r"\.(mp4|webm)(\?|$)", url, re.I)
             ):
                 video_url = url
 
             if "/api/public/board/" in url:
-
-                async def capture_board():
+                async def get_board():
                     nonlocal board
 
                     try:
@@ -179,18 +165,15 @@ async def download_lecture(
                         if isinstance(data, list):
                             if board is None or len(data) > len(board):
                                 board = data
-
                     except Exception:
                         pass
 
-                pending.append(
-                    asyncio.create_task(capture_board())
-                )
+                pending.append(asyncio.create_task(get_board()))
 
-        context.on("response", on_response)
+        context.on("response", received)
 
-        await navigate(page, lesson["watch_url"])
-        await page.wait_for_timeout(8000)
+        await load(page, lecture["watch_url"])
+        await page.wait_for_timeout(8500)
 
         try:
             await page.locator("video").first.evaluate(
@@ -199,31 +182,30 @@ async def download_lecture(
         except Exception:
             pass
 
-        await page.wait_for_timeout(3500)
+        await page.wait_for_timeout(2500)
 
         if pending:
             await asyncio.gather(
-                *pending,
-                return_exceptions=True,
+                *pending, return_exceptions=True
             )
 
         if not video_url:
             video_url = await page.evaluate("""
-                () => document.querySelector("video")?.currentSrc
-                   || document.querySelector("video")?.src
-                   || null
+            () => document.querySelector('video')?.currentSrc
+               || document.querySelector('video')?.src
+               || null
             """)
 
         if not video_url or board is None:
             raise RuntimeError(
-                "Video URL or board JSON could not be captured."
+                "Video or board unavailable on lecture page"
             )
 
-        events = board_event_count(board)
+        count = count_board_events(board)
 
-        if not events:
+        if count == 0:
             raise RuntimeError(
-                "Board JSON contains no recognized events."
+                "Board JSON has no recognized events"
             )
 
         (folder / "board.json").write_text(
@@ -231,103 +213,101 @@ async def download_lecture(
             encoding="utf-8",
         )
 
-        suffix = (
-            ".mp4"
-            if urlparse(video_url).path.lower().endswith(".mp4")
+        ext = (
+            ".mp4" if urlparse(video_url).path.endswith(".mp4")
             else ".webm"
         )
 
         cookies = await context.cookies(video_url)
 
         headers = {
-            "User-Agent": await page.evaluate(
-                "navigator.userAgent"
-            ),
+            "User-Agent": await page.evaluate("navigator.userAgent"),
             "Referer": BASE + "/",
             "Accept-Encoding": "identity",
         }
 
         if cookies:
             headers["Cookie"] = "; ".join(
-                f"{cookie['name']}={cookie['value']}"
-                for cookie in cookies
+                c["name"] + "=" + c["value"] for c in cookies
             )
 
-        await fetch_video(
+        await download_video(
             video_url,
-            folder / ("video" + suffix),
+            folder / ("video" + ext),
             headers,
             progress,
         )
 
-        assets = find_board_assets(board)
+        urls = walk_urls(board)
 
-        for key in ("annotated_pdf", "plain_pdf"):
-            url = lesson.get(key)
+        for field in ("annotated_pdf", "plain_pdf"):
+            value = lecture.get(field)
 
-            if url and url not in assets:
-                assets.append(url)
+            if value and value not in urls:
+                urls.append(value)
 
-        asset_dir = folder / "assets"
-        asset_dir.mkdir(exist_ok=True)
+        assets_dir = folder / "assets"
+        assets_dir.mkdir(exist_ok=True)
 
         saved = []
-        failures = []
+        errors = []
 
-        for i, url in enumerate(assets, 1):
-            ext = Path(urlparse(url).path).suffix.lower()
+        for index, url in enumerate(urls, 1):
+            ext_asset = Path(urlparse(url).path).suffix.lower()
 
-            if ext not in (
-                ".jpg", ".jpeg", ".png", ".webp", ".pdf"
+            if ext_asset not in (
+                ".png", ".jpg", ".jpeg", ".webp", ".pdf"
             ):
-                ext = ".bin"
+                ext_asset = ".bin"
 
-            name = f"asset_{i:03d}{ext}"
-            destination = asset_dir / name
+            name = f"asset_{index:03d}{ext_asset}"
 
             try:
                 response = await context.request.get(
-                    url,
-                    timeout=120000,
+                    url, timeout=120000
                 )
 
                 if not response.ok:
                     raise RuntimeError(
-                        f"Asset HTTP {response.status}"
+                        f"HTTP {response.status}"
                     )
 
-                data = await response.body()
+                content = await response.body()
 
-                if not data:
+                if not content:
                     raise RuntimeError("Empty asset")
 
-                if data[:200].lstrip().lower().startswith(
+                if content[:200].lstrip().lower().startswith(
                     (b"<!doctype", b"<html")
                 ):
-                    raise RuntimeError(
-                        "Received HTML instead of asset"
-                    )
+                    raise RuntimeError("HTML returned")
 
-                destination.write_bytes(data)
+                (assets_dir / name).write_bytes(content)
 
                 saved.append({
-                    "file": name,
-                    "source_sha256": hashlib.sha256(
+                    "filename": name,
+                    "url_sha256": hashlib.sha256(
                         url.encode()
                     ).hexdigest(),
                 })
 
             except Exception as error:
-                failures.append({
-                    "number": i,
-                    "error": str(error)[:200],
+                errors.append({
+                    "asset": index,
+                    "error_type": type(error).__name__,
                 })
 
             if progress:
                 await progress(
-                    "assets",
-                    i * 100 / max(len(assets), 1),
+                    "Assets",
+                    index * 100 / max(len(urls), 1),
                 )
+
+        if errors:
+            raise RuntimeError(
+                f"{len(errors)} assets failed; "
+                "partial files saved for retry"
+            )
 
         (folder / "asset_index.json").write_text(
             json.dumps(saved, indent=2),
@@ -335,15 +315,13 @@ async def download_lecture(
         )
 
         manifest = {
-            "lecture_key": lecture_key,
+            "lecture_key": key,
             "batch_uid": subject["uid"],
-            "class_number": lesson["class_number"],
-            "title": lesson["title"],
-            "board_events": events,
-            "video": "video" + suffix,
-            "assets_found": len(assets),
+            "class_number": lecture["class_number"],
+            "title": lecture["title"],
+            "video": "video" + ext,
+            "board_events": count,
             "assets_saved": len(saved),
-            "asset_failures": failures,
         }
 
         (folder / "manifest.json").write_text(
@@ -351,23 +329,14 @@ async def download_lecture(
             encoding="utf-8",
         )
 
-        if failures:
-            raise RuntimeError(
-                f"{len(failures)} assets failed. "
-                "Partial lecture kept locally."
-            )
-
         with zipfile.ZipFile(
-            folder / "slides.zip",
-            "w",
+            folder / "slides.zip", "w",
             zipfile.ZIP_DEFLATED,
         ) as archive:
-
-            for file in sorted(asset_dir.iterdir()):
+            for file in assets_dir.iterdir():
                 if file.is_file():
                     archive.write(
-                        file,
-                        "slides/" + file.name,
+                        file, "slides/" + file.name
                     )
 
             archive.write(
@@ -378,4 +347,4 @@ async def download_lecture(
         return folder, manifest
 
     finally:
-        await close_browser(pw, context)
+        await stop_browser(pw, context)
