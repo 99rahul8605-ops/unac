@@ -520,7 +520,7 @@ async def confirm(event, state):
     chosen = state["chosen"]
 
     text = "\n".join([
-        "📋 Confirm download and upload",
+        ("📄 Confirm TXT generation" if state.get("mode") == "txt" else "📋 Confirm download and upload"),
         "",
         "Goal: " + state["goal"]["name"],
         "Pack: " + state["pack"]["name"],
@@ -560,8 +560,69 @@ async def message_handler(event):
     ):
         return
 
+    # TXT_UPLOADER_HOOK_V1
+    from upload_controls import handle_upload_event
+
+    if await handle_upload_event(
+        event, tg, OWNER, int(os.environ["STORAGE_GROUP_ID"])
+    ):
+        return
+
     message = event.raw_text.strip()
     low = message.lower()
+
+    # TXT_EXPORT_COMMAND_V1
+    if low.startswith("/export"):
+        match = re.fullmatch(r"/export(?:@\w+)?\s+(\d+)", low)
+
+        if not match:
+            await event.respond("Usage: /export 2")
+            return
+
+        job_id = int(match.group(1))
+        txt = ROOT / "exports" / f"job_{job_id}_lectures.txt"
+
+        if not txt.is_file():
+            await event.respond(
+                f"Job #{job_id} ka TXT nahi mila. "
+                "Pehle export generate karna hoga."
+            )
+            return
+
+        if not re.search(
+            r"^WATCH_URL: https?://",
+            txt.read_text(encoding="utf-8"),
+            re.M
+        ):
+            await event.respond(
+                "TXT mein koi watch link nahi hai."
+            )
+            return
+
+        await event.respond(
+            f"Sending Job #{job_id} lecture TXT..."
+        )
+        await tg.send_file(
+            event.chat_id,
+            str(txt),
+            caption=f"Lecture TXT — Job #{job_id}"
+        )
+        return
+
+
+    # AUTO_TXT_FLOW_V1
+    if low == "/txt":
+        menus[OWNER] = {
+            "step": "category",
+            "page": 0,
+            "mode": "txt",
+        }
+        await event.respond(
+            "📄 TXT Generator\\n\\n"
+            "Category/search keyword bhejo.\\n"
+            "Example: CA / CA Intermediate"
+        )
+        return
 
     if low in ("/start", "/search"):
         menus[OWNER] = {
@@ -796,6 +857,19 @@ async def message_handler(event):
 
 @tg.on(events.CallbackQuery)
 async def callback_handler(event):
+
+    # UPLOAD_CONTROLS_V2
+    from upload_controls import handle_upload_callback
+
+    if await handle_upload_callback(
+        event,
+        tg,
+        OWNER,
+        int(os.environ["STORAGE_GROUP_ID"])
+    ):
+        return
+
+
     if event.sender_id != OWNER:
         await event.answer(
             "Not authorized",
@@ -1042,6 +1116,25 @@ async def callback_handler(event):
         # Immediately prevent the same YES button
         # from queuing duplicate jobs.
         state["step"] = "queued"
+
+        if state.get("mode") == "txt":
+            await event.answer("Generating TXT")
+            menus.pop(OWNER, None)
+
+            from txt_feature import generate_txt
+
+            # Same profile as successful terminal TXT export.
+            txt_profile = STATE / "verified_backup"
+
+            try:
+                await generate_txt(event, state, txt_profile)
+            except Exception as error:
+                logging.exception("TXT generation failed")
+                await event.respond(
+                    "TXT export error: "
+                    + clean_error(error)
+                )
+            return
 
         payload = {
             "goal": state["goal"],

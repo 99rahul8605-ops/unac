@@ -17,6 +17,9 @@ API_URL = "http://127.0.0.1:8091"
 
 WORK.mkdir(parents=True, exist_ok=True)
 
+# BATCH_FORUM_ROUTING_V1
+ACTIVE_TOPIC_ID = None
+
 active_task = None
 progress_info = {
     "stage": "Idle",
@@ -24,6 +27,11 @@ progress_info = {
     "done": 0,
     "total": 0,
     "percent": 0,
+    "speed_bps": 0,
+    "current_bytes": 0,
+    "total_bytes": 0,
+    "eta_seconds": None,
+    # SPEED_PATCH_V2
 }
 
 waiting_for_txt = set()
@@ -80,8 +88,11 @@ def parse_txt(path):
 
 
 def receipt_path(url):
+    if ACTIVE_TOPIC_ID is None:
+        raise RuntimeError("Batch topic not selected")
+
     digest = hashlib.sha256(
-        url.encode("utf-8")
+        f"{ACTIVE_TOPIC_ID}|{url}".encode("utf-8")
     ).hexdigest()
 
     return WORK / f"{digest}.json"
@@ -194,6 +205,10 @@ async def wait_api(job_id):
         progress_info["percent"] = (
             result.get("percent") or 0
         )
+        progress_info["speed_bps"] = result.get("speed_bps") or 0
+        progress_info["current_bytes"] = result.get("downloaded_bytes") or 0
+        progress_info["total_bytes"] = result.get("total_bytes") or 0
+        progress_info["eta_seconds"] = result.get("eta_seconds")
 
         if result["status"] in (
             "completed",
@@ -288,7 +303,31 @@ async def upload_one(
     progress_info["stage"] = f"Uploading {kind}"
     progress_info["percent"] = 0
 
+    previous_time = time.monotonic()
+    previous_bytes = 0
+    speed = 0.0
+
     def on_progress(current, total):
+        nonlocal previous_time, previous_bytes, speed
+
+        now = time.monotonic()
+        elapsed = now - previous_time
+
+        if elapsed >= 0.75:
+            instant = max(0, current - previous_bytes) / elapsed
+            speed = instant if speed == 0 else (
+                0.3 * instant + 0.7 * speed
+            )
+            previous_time = now
+            previous_bytes = current
+
+        progress_info["current_bytes"] = current
+        progress_info["total_bytes"] = total
+        progress_info["speed_bps"] = speed
+        progress_info["eta_seconds"] = (
+            round((total - current) / speed)
+            if total and speed > 0 else None
+        )
         if total:
             progress_info["percent"] = round(
                 current * 100 / total, 1
@@ -305,6 +344,7 @@ async def upload_one(
         destination,
         str(path),
         caption=caption,
+        reply_to=ACTIVE_TOPIC_ID,
         force_document=True,
         progress_callback=on_progress,
     )
@@ -332,12 +372,25 @@ async def progress_ticker(message):
     while True:
         info = progress_info.copy()
 
+        mb = 1024 * 1024
+        speed = info.get("speed_bps", 0) / mb
+        current = info.get("current_bytes", 0) / mb
+        total = info.get("total_bytes", 0) / mb
+        eta = info.get("eta_seconds")
+        eta_text = (
+            f"{eta // 60}m {eta % 60}s"
+            if eta is not None else "Calculating"
+        )
+
         output = (
             "📤 TXT Uploader\n\n"
             f"Lecture: {info['lecture'][:110]}\n"
             f"Progress: {info['done']}/{info['total']}\n"
             f"Stage: {info['stage']}\n"
-            f"Percentage: {info['percent']}%"
+            f"Percentage: {info['percent']}%\\n"
+            f"Speed: {speed:.2f} MB/s\\n"
+            f"Transferred: {current:.1f}/{total:.1f} MB\\n"
+            f"ETA: {eta_text}"
         )
 
         if output != last:
@@ -362,6 +415,22 @@ async def run_upload(
 
     try:
         lectures = parse_txt(txt_path)
+
+        # Batch topic selected before any download starts.
+        global ACTIVE_TOPIC_ID
+        from forum_topics import ensure_batch_topic
+
+        ACTIVE_TOPIC_ID, batch_name = await ensure_batch_topic(
+            client, destination, txt_path
+        )
+
+        await client.send_message(
+            owner,
+            "📁 Batch Forum Topic Ready\\n"
+            f"Batch: {batch_name}\\n"
+            f"Topic ID: {ACTIVE_TOPIC_ID}\\n"
+            "All files will upload inside this topic."
+        )
 
         if not lectures:
             await client.send_message(

@@ -12,3 +12,32 @@ __pycache__/
 *.sqlite*
 *.log
 browser_profile/
+
+# VPS secrets and local runtime files
+.env
+.env.*
+!.env.example
+.state/
+api_downloads/
+downloads/
+exports/
+sessions/
+*.session
+*.session-journal
+*.sqlite3
+*.db
+*.key
+*.pem
+*.part
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local backups and installers
+*.before_*
+*.py.before_*
+install_speed.py
+fix_speed.py
+install_forum.py

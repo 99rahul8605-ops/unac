@@ -126,7 +126,10 @@ def download_one(session, url, destination, job_id):
 
         total = existing + length if length else 0
         received = existing
-        last_update = 0.0
+        # SPEED_PATCH_V2
+        last_update = time.monotonic()
+        last_bytes = received
+        speed_bps = 0.0
 
         with open(partial, mode) as output:
             for chunk in response.iter_content(CHUNK):
@@ -139,6 +142,13 @@ def download_one(session, url, destination, job_id):
                 now = time.monotonic()
 
                 if now - last_update >= 1:
+                    elapsed = max(now - last_update, 0.001)
+                    instant = max(0, received - last_bytes) / elapsed
+                    speed_bps = (
+                        instant if speed_bps == 0
+                        else 0.3 * instant + 0.7 * speed_bps
+                    )
+                    last_bytes = received
                     percent = (
                         round(received * 100 / total, 1)
                         if total else None
@@ -148,7 +158,12 @@ def download_one(session, url, destination, job_id):
                         job_id,
                         downloaded_bytes=received,
                         total_bytes=total,
-                        percent=percent
+                        percent=percent,
+                        speed_bps=round(speed_bps),
+                        eta_seconds=(
+                            round((total - received) / speed_bps)
+                            if total and speed_bps > 0 else None
+                        )
                     )
 
                     last_update = now

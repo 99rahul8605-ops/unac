@@ -254,6 +254,11 @@ async def handle_upload_callback(event, client, owner, destination):
                 "",
             ])
 
+        # BATCH_FORUM_HEADER_V1
+        from forum_topics import read_batch
+        batch_name = read_batch(source)
+        lines.insert(1, f"BATCH: {batch_name}")
+
         source.write_text(
             "\n".join(lines),
             encoding="utf-8"

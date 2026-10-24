@@ -11,7 +11,7 @@ ROOT = Path("/root/unac")
 STATE = ROOT / ".state"
 DB = STATE / "jobs.sqlite3"
 OUTPUT = ROOT / "exports"
-PROFILE = STATE / "browser_profile"
+PROFILE = STATE / "verified_backup"
 
 OUTPUT.mkdir(parents=True, exist_ok=True)
 

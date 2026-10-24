@@ -88,6 +88,17 @@ async def resolve_lecture(lecture):
             def on_response(response):
                 remember(response.url)
 
+                content_type = response.headers.get(
+                    "content-type", ""
+                ).lower().split(";")[0].strip()
+
+                if (
+                    content_type.startswith("video/")
+                    and response.status in (200, 206)
+                    and response.url not in video_urls
+                ):
+                    video_urls.append(response.url)
+
             context.on("request", on_request)
             context.on("response", on_response)
 
@@ -97,6 +108,8 @@ async def resolve_lecture(lecture):
                 timeout=90000,
             )
 
+            await page.wait_for_timeout(5000)
+
             for attempt in range(30):
                 verify = page.get_by_text(
                     "Verify you're human",
@@ -104,9 +117,19 @@ async def resolve_lecture(lecture):
                 ).first
 
                 if await verify.is_visible():
-                    raise RuntimeError(
-                        "Website requires manual verification"
-                    )
+                    dialog = page.locator(
+                        '[role="dialog"][aria-modal="true"]'
+                    ).first
+
+                    video = page.locator("video").first
+
+                    if (
+                        await dialog.is_visible()
+                        and not await video.is_visible()
+                    ):
+                        raise RuntimeError(
+                            "Website requires manual verification"
+                        )
 
                 if attempt == 2:
                     try:
