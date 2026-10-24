@@ -1,11 +1,14 @@
+
 import os
-import json
 import re
+import json
+import time
 import asyncio
 import sqlite3
 import logging
-import time
+
 from pathlib import Path
+
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 
@@ -13,21 +16,31 @@ from catalog import goals, batches, subjects, classes
 from downloader import download_lecture
 from storage import Storage
 
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
 ROOT = Path(__file__).resolve().parent
+
 load_dotenv(ROOT / ".env")
 
 STATE = ROOT / ".state"
 FILES = ROOT / "downloads"
 
-STATE.mkdir(exist_ok=True)
-FILES.mkdir(exist_ok=True)
+STATE.mkdir(parents=True, exist_ok=True)
+FILES.mkdir(parents=True, exist_ok=True)
 
-required = [
-    "API_ID", "API_HASH", "BOT_TOKEN",
-    "OWNER_ID", "STORAGE_GROUP_ID", "MONGODB_URI",
+REQUIRED = [
+    "API_ID",
+    "API_HASH",
+    "BOT_TOKEN",
+    "OWNER_ID",
+    "STORAGE_GROUP_ID",
+    "MONGODB_URI",
 ]
 
-missing = [x for x in required if not os.getenv(x)]
+missing = [key for key in REQUIRED if not os.getenv(key)]
 
 if missing:
     raise SystemExit(
@@ -35,11 +48,33 @@ if missing:
     )
 
 OWNER = int(os.environ["OWNER_ID"])
-PROFILE = STATE / "browser_profile"
+
+# IMPORTANT:
+# Browsing and downloading must not use
+# the same persistent Chromium profile.
+#
+# Browsing remains available while the
+# download browser is running.
+
+BROWSE_PROFILE = STATE / "browse_profile"
+DOWNLOAD_PROFILE = STATE / "browser_profile"
+
+# Jobs can queue independently.
+# Only one download worker is started,
+# avoiding simultaneous heavy downloads.
+
+MAX_ACTIVE_DOWNLOADS = 1
+
+LIVE_INTERVAL = 4
+HEARTBEAT_INTERVAL = 12
 
 logging.basicConfig(
     filename=STATE / "errors.log",
     level=logging.INFO,
+    format=(
+        "%(asctime)s %(levelname)s "
+        "%(name)s %(message)s"
+    ),
 )
 
 tg = TelegramClient(
@@ -50,7 +85,18 @@ tg = TelegramClient(
 
 storage = Storage()
 
-sql = sqlite3.connect(STATE / "jobs.sqlite3")
+
+# ==========================================
+# SQLITE JOB QUEUE
+# ==========================================
+
+sql = sqlite3.connect(
+    STATE / "jobs.sqlite3",
+    timeout=30,
+)
+
+sql.execute("PRAGMA busy_timeout=30000")
+
 sql.execute("""
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,37 +106,294 @@ CREATE TABLE IF NOT EXISTS jobs (
     errors INTEGER DEFAULT 0
 )
 """)
-sql.execute(
-    "UPDATE jobs SET status='queued' WHERE status='running'"
-)
+
+# An interrupted download job can be
+# resumed through the queue on restart.
+sql.execute("""
+UPDATE jobs
+SET status='queued'
+WHERE status='running'
+""")
+
 sql.commit()
 
+
+# ==========================================
+# RUNTIME STATE
+# ==========================================
+
 menus = {}
+
 paused = False
 cancel_requested = False
 
+catalog_lock = asyncio.Lock()
+live_lock = asyncio.Lock()
+
+progress_message = None
+last_live_sent = 0.0
+
 activity = {
+    "job_id": None,
     "stage": "Idle",
+    "detail": "",
+    "subject": "",
     "lecture": "",
+    "percent": 0.0,
+    "done": 0,
+    "errors": 0,
+    "started": time.monotonic(),
+    "last_progress": time.monotonic(),
 }
 
-last_update = 0
-progress_message = None
 
+# ==========================================
+# HELPERS
+# ==========================================
 
 def clean_error(error):
-    return re.sub(
-        r"([?&]k=)[^&\s]+",
-        r"\1[hidden]",
-        str(error),
-    )[:500]
+    text = str(error)
 
+    # Avoid exposing sensitive media query
+    # parameters in Telegram errors.
+    text = re.sub(
+        r"([?&](?:k|token|signature|sig|key)=)[^&\s]+",
+        r"\1[hidden]",
+        text,
+        flags=re.I,
+    )
+
+    return text[:500]
+
+
+def elapsed_text(seconds):
+    seconds = max(0, int(seconds))
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+
+    if minutes:
+        return f"{minutes}m {seconds}s"
+
+    return f"{seconds}s"
+
+
+def set_activity(
+    stage=None,
+    detail=None,
+    percent=None,
+    lecture=None,
+    subject=None,
+    job_id=None,
+):
+    now = time.monotonic()
+
+    if stage is not None:
+        activity["stage"] = stage
+
+    if detail is not None:
+        activity["detail"] = detail
+
+    if percent is not None:
+        activity["percent"] = max(
+            0,
+            min(100, float(percent)),
+        )
+
+    if lecture is not None:
+        activity["lecture"] = lecture
+
+    if subject is not None:
+        activity["subject"] = subject
+
+    if job_id is not None:
+        activity["job_id"] = job_id
+
+    activity["last_progress"] = now
+
+
+def format_activity():
+    now = time.monotonic()
+
+    lines = [
+        "📊 Lecture Manager — Live Progress",
+        "",
+        f"Job: #{activity['job_id'] or '-'}",
+        f"Stage: {activity['stage']}",
+    ]
+
+    if activity["subject"]:
+        lines.append(
+            "Subject: "
+            + activity["subject"][:100]
+        )
+
+    if activity["lecture"]:
+        lines.append(
+            "Lecture: "
+            + activity["lecture"][:100]
+        )
+
+    if activity["detail"]:
+        lines.append(
+            "Operation: "
+            + activity["detail"][:100]
+        )
+
+    if activity["stage"] in (
+        "Downloading",
+        "Uploading",
+        "Packaging",
+    ):
+        lines.append(
+            f"Progress: {activity['percent']:.1f}%"
+        )
+
+    lines.extend([
+        f"Elapsed: {elapsed_text(now - activity['started'])}",
+        (
+            "Last progress update: "
+            + elapsed_text(
+                now - activity["last_progress"]
+            )
+            + " ago"
+        ),
+        (
+            f"Done: {activity['done']} | "
+            f"Errors: {activity['errors']}"
+        ),
+        f"Queue paused: {paused}",
+    ])
+
+    return "\n".join(lines)
+
+
+async def notify(text):
+    try:
+        await tg.send_message(
+            OWNER,
+            text[:4000],
+        )
+    except Exception:
+        logging.exception(
+            "Owner notification failed"
+        )
+
+
+async def live(text=None, force=False):
+    global progress_message, last_live_sent
+
+    async with live_lock:
+        now = time.monotonic()
+
+        if (
+            not force
+            and now - last_live_sent < LIVE_INTERVAL
+        ):
+            return
+
+        message = (
+            text if text is not None
+            else format_activity()
+        )
+
+        try:
+            if progress_message is None:
+                progress_message = await tg.send_message(
+                    OWNER,
+                    message[:3900],
+                )
+            else:
+                await tg.edit_message(
+                    OWNER,
+                    progress_message.id,
+                    message[:3900],
+                )
+
+            last_live_sent = time.monotonic()
+
+        except Exception as error:
+            # Editing identical text is not a
+            # real failure.
+            if "MessageNotModified" in type(error).__name__:
+                last_live_sent = time.monotonic()
+                return
+
+            logging.exception(
+                "Live progress update failed"
+            )
+
+            # If the progress message disappeared,
+            # recreate it on the next attempt.
+            if (
+                "MessageIdInvalid" in type(error).__name__
+                or "MessageDeleteForbidden" in type(error).__name__
+            ):
+                progress_message = None
+
+
+async def heartbeat():
+    while True:
+        await asyncio.sleep(
+            HEARTBEAT_INTERVAL
+        )
+
+        if activity["stage"] == "Idle":
+            continue
+
+        # Even when the website hasn't returned
+        # any progress, the owner can see that the
+        # worker is waiting and for how long.
+        await live(
+            format_activity(),
+            force=True,
+        )
+
+
+def recent_jobs(limit=5):
+    return sql.execute(
+        """
+        SELECT id,status,done,errors
+        FROM jobs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def update_job_counts(job_id, done, errors):
+    sql.execute(
+        """
+        UPDATE jobs
+        SET done=?, errors=?
+        WHERE id=?
+        """,
+        (done, errors, job_id),
+    )
+    sql.commit()
+
+
+# ==========================================
+# INLINE MENUS
+# ==========================================
 
 def menu_text(items, label, page):
     per_page = 10
+
     start = page * per_page
-    end = min(start + per_page, len(items))
-    pages = max(1, (len(items) + per_page - 1) // per_page)
+    end = min(
+        start + per_page,
+        len(items),
+    )
+
+    pages = max(
+        1,
+        (len(items) + per_page - 1) // per_page,
+    )
 
     lines = [
         label,
@@ -99,13 +402,17 @@ def menu_text(items, label, page):
 
     for index in range(start, end):
         lines.append(
-            f"{index + 1}. {items[index]['name'][:130]}"
+            f"{index + 1}. "
+            f"{items[index]['name'][:130]}"
         )
 
     lines.extend([
         "",
-        f"Page {page + 1}/{pages} | Total {len(items)}",
-        "Item select karne ke liye neeche button dabao.",
+        (
+            f"Page {page + 1}/{pages} | "
+            f"Total {len(items)}"
+        ),
+        "Neeche button se select karo.",
     ])
 
     return "\n".join(lines)
@@ -113,12 +420,16 @@ def menu_text(items, label, page):
 
 def menu_buttons(items, page):
     start = page * 10
-    end = min(start + 10, len(items))
+    end = min(
+        start + 10,
+        len(items),
+    )
 
     rows = []
 
     for index in range(start, end):
         name = items[index]["name"][:29]
+
         rows.append([
             Button.inline(
                 f"{index + 1}. {name}",
@@ -150,7 +461,11 @@ def menu_buttons(items, page):
     return rows
 
 
-async def show_menu(event, state, edit=False):
+async def show_menu(
+    event,
+    state,
+    edit=False,
+):
     field = {
         "goal": "goals",
         "pack": "packs",
@@ -167,9 +482,15 @@ async def show_menu(event, state, edit=False):
     page = state.get("page", 0)
 
     text = menu_text(
-        items, titles[state["step"]], page
+        items,
+        titles[state["step"]],
+        page,
     )
-    buttons = menu_buttons(items, page)
+
+    buttons = menu_buttons(
+        items,
+        page,
+    )
 
     if state["step"] == "subjects":
         buttons.append([
@@ -178,51 +499,27 @@ async def show_menu(event, state, edit=False):
                 b"select:all",
             )
         ])
-        text += "\n\nYa 1,3,5 type kar sakte ho."
+
+        text += (
+            "\n\nYa 1,3,5 type kar sakte ho."
+        )
 
     if edit:
-        await event.edit(text, buttons=buttons)
+        await event.edit(
+            text,
+            buttons=buttons,
+        )
     else:
-        await event.respond(text, buttons=buttons)
-
-
-async def notify(text):
-    try:
-        await tg.send_message(OWNER, text[:4000])
-    except Exception:
-        logging.exception("Owner DM failed")
-
-
-async def live(text, force=False):
-    global last_update, progress_message
-
-    current = time.monotonic()
-
-    if not force and current - last_update < 8:
-        return
-
-    last_update = current
-
-    try:
-        if progress_message:
-            await tg.edit_message(
-                OWNER,
-                progress_message.id,
-                text[:3900],
-            )
-        else:
-            progress_message = await tg.send_message(
-                OWNER,
-                text[:3900],
-            )
-    except Exception:
-        logging.exception("Progress message failed")
+        await event.respond(
+            text,
+            buttons=buttons,
+        )
 
 
 async def confirm(event, state):
     chosen = state["chosen"]
 
-    lines = [
+    text = "\n".join([
         "📋 Confirm download and upload",
         "",
         "Goal: " + state["goal"]["name"],
@@ -230,108 +527,199 @@ async def confirm(event, state):
         f"Subjects: {len(chosen)}",
         "",
         "Authorized content only.",
-    ]
+    ])
 
     state["step"] = "confirm"
 
     await event.respond(
-        "\n".join(lines),
+        text,
         buttons=[[
-            Button.inline("✅ YES", b"confirm:yes"),
-            Button.inline("❌ NO", b"confirm:no"),
+            Button.inline(
+                "✅ YES",
+                b"confirm:yes",
+            ),
+            Button.inline(
+                "❌ NO",
+                b"confirm:no",
+            ),
         ]],
     )
 
+
+# ==========================================
+# COMMANDS AND SEARCH
+# ==========================================
 
 @tg.on(events.NewMessage(incoming=True))
 async def message_handler(event):
     global paused, cancel_requested
 
-    if not event.is_private or event.sender_id != OWNER:
+    if (
+        not event.is_private
+        or event.sender_id != OWNER
+    ):
         return
 
     message = event.raw_text.strip()
     low = message.lower()
 
     if low in ("/start", "/search"):
-        menus[OWNER] = {"step": "category", "page": 0}
+        menus[OWNER] = {
+            "step": "category",
+            "page": 0,
+            "busy": False,
+        }
 
         await event.respond(
             "🤖 Lecture Manager\n\n"
             "Category/search keyword bhejo.\n"
             "Example: CA / CA Foundation / UPSC\n\n"
-            "/status /pause /resume /cancel /retry"
+            "Bot ko downloading ke waqt bhi "
+            "use kar sakte ho.\n\n"
+            "/status /queue /pause "
+            "/resume /cancel /retry"
         )
         return
 
     if low == "/status":
-        jobs = sql.execute(
-            "SELECT id,status,done,errors FROM jobs "
-            "ORDER BY id DESC LIMIT 4"
-        ).fetchall()
-
-        text = [
-            "Stage: " + activity["stage"],
-            "Lecture: " + activity["lecture"],
-            "Paused: " + str(paused),
+        lines = [
+            format_activity(),
+            "",
+            "Recent jobs:",
         ]
 
-        text += [
-            f"Job #{i}: {s} | done={d} | errors={e}"
-            for i, s, d, e in jobs
-        ]
+        lines.extend(
+            (
+                f"Job #{job_id}: {status} | "
+                f"done={done} | errors={errors}"
+            )
+            for job_id, status, done, errors
+            in recent_jobs()
+        )
 
-        await event.respond("\n".join(text))
+        await event.respond(
+            "\n".join(lines)
+        )
+        return
+
+    if low == "/queue":
+        rows = recent_jobs(15)
+
+        if not rows:
+            await event.respond(
+                "Queue empty."
+            )
+            return
+
+        text = ["📋 Jobs", ""]
+
+        for job_id, status, done, errors in rows:
+            text.append(
+                f"#{job_id} — {status} "
+                f"| Done {done} | Errors {errors}"
+            )
+
+        await event.respond(
+            "\n".join(text)
+        )
         return
 
     if low == "/pause":
         paused = True
-        await event.respond("⏸ Queue paused.")
+
+        await event.respond(
+            "⏸ Queue paused.\n"
+            "Current lecture can finish; "
+            "next lecture won't start until /resume."
+        )
         return
 
     if low == "/resume":
         paused = False
-        await event.respond("▶️ Queue resumed.")
+
+        await event.respond(
+            "▶️ Queue resumed."
+        )
         return
 
     if low == "/cancel":
         cancel_requested = True
+
         await event.respond(
-            "🛑 Cancellation requested."
+            "🛑 Cancellation requested.\n"
+            "Current operation may finish first. "
+            "No next lecture will start."
         )
         return
 
     if low == "/retry":
         row = sql.execute(
-            "SELECT id FROM jobs WHERE status IN "
-            "('failed','completed_with_errors') "
-            "ORDER BY id DESC LIMIT 1"
+            """
+            SELECT id
+            FROM jobs
+            WHERE status IN (
+                'failed',
+                'completed_with_errors'
+            )
+            ORDER BY id DESC
+            LIMIT 1
+            """
         ).fetchone()
 
         if not row:
-            await event.respond("No failed job.")
-        else:
-            sql.execute(
-                "UPDATE jobs SET status='queued' WHERE id=?",
-                (row[0],),
-            )
-            sql.commit()
             await event.respond(
-                f"♻️ Job #{row[0]} queued."
+                "No failed job."
             )
+            return
+
+        sql.execute(
+            """
+            UPDATE jobs
+            SET status='queued',
+                done=0,
+                errors=0
+            WHERE id=?
+            """,
+            (row[0],),
+        )
+
+        sql.commit()
+
+        await event.respond(
+            f"♻️ Job #{row[0]} queued."
+        )
         return
 
     state = menus.get(OWNER)
 
     if not state:
-        await event.respond("Send /start")
+        await event.respond(
+            "Send /start"
+        )
         return
 
     if state["step"] == "category":
-        await event.respond("🔎 Searching goals...")
+        if state.get("busy"):
+            await event.respond(
+                "Search already running."
+            )
+            return
+
+        state["busy"] = True
+
+        await event.respond(
+            "🔎 Searching goals..."
+        )
 
         try:
-            items = await goals(PROFILE, message)
+            # A separate Chromium profile prevents
+            # conflict with the download browser.
+            async with catalog_lock:
+                items = await goals(
+                    BROWSE_PROFILE,
+                    message,
+                )
+
         except Exception as error:
             await event.respond(
                 "Goal discovery failed:\n"
@@ -339,9 +727,17 @@ async def message_handler(event):
             )
             return
 
+        finally:
+            state["busy"] = False
+
+        # Ignore an old search if /start opened
+        # a newer selection session.
+        if menus.get(OWNER) is not state:
+            return
+
         if not items:
             await event.respond(
-                "No goals found. Try another search term."
+                "No goals found. Try another term."
             )
             return
 
@@ -351,33 +747,42 @@ async def message_handler(event):
             "page": 0,
         })
 
-        await show_menu(event, state)
+        await show_menu(
+            event,
+            state,
+        )
         return
 
     if state["step"] == "subjects":
         try:
             indices = [
-                int(x.strip()) for x in message.split(",")
+                int(x.strip())
+                for x in message.split(",")
             ]
 
             if not indices or any(
-                x < 1 or x > len(state["subjects"])
-                for x in indices
+                index < 1
+                or index > len(state["subjects"])
+                for index in indices
             ):
                 raise ValueError()
 
             state["chosen"] = [
-                state["subjects"][n - 1]
-                for n in dict.fromkeys(indices)
+                state["subjects"][number - 1]
+                for number in dict.fromkeys(indices)
             ]
+
         except ValueError:
             await event.respond(
-                "Use subject numbers like 1,3,5 "
-                "or Select ALL button."
+                "Use numbers like 1,3,5 "
+                "or Select ALL."
             )
             return
 
-        await confirm(event, state)
+        await confirm(
+            event,
+            state,
+        )
         return
 
     await event.respond(
@@ -385,10 +790,17 @@ async def message_handler(event):
     )
 
 
+# ==========================================
+# INLINE BUTTON HANDLER
+# ==========================================
+
 @tg.on(events.CallbackQuery)
 async def callback_handler(event):
     if event.sender_id != OWNER:
-        await event.answer("Not authorized", alert=True)
+        await event.answer(
+            "Not authorized",
+            alert=True,
+        )
         return
 
     state = menus.get(OWNER)
@@ -400,13 +812,20 @@ async def callback_handler(event):
         )
         return
 
-    data = event.data.decode("utf-8", errors="ignore")
+    data = event.data.decode(
+        "utf-8",
+        errors="ignore",
+    )
 
     if data.startswith("page:"):
         if state["step"] not in (
-            "goal", "pack", "subjects"
+            "goal",
+            "pack",
+            "subjects",
         ):
-            await event.answer("Invalid menu")
+            await event.answer(
+                "Invalid menu"
+            )
             return
 
         field = {
@@ -416,26 +835,50 @@ async def callback_handler(event):
         }[state["step"]]
 
         count = len(state[field])
-        last = max(0, (count - 1) // 10)
+        last = max(
+            0,
+            (count - 1) // 10,
+        )
 
         change = (
-            1 if data == "page:next" else -1
+            1 if data == "page:next"
+            else -1
         )
 
         state["page"] = max(
             0,
-            min(last, state["page"] + change),
+            min(
+                last,
+                state["page"] + change,
+            ),
         )
 
         await event.answer()
-        await show_menu(event, state, edit=True)
+
+        await show_menu(
+            event,
+            state,
+            edit=True,
+        )
         return
 
     if data.startswith("pick:"):
         step = state["step"]
 
-        if step not in ("goal", "pack", "subjects"):
-            await event.answer("Invalid selection")
+        if step not in (
+            "goal",
+            "pack",
+            "subjects",
+        ):
+            await event.answer(
+                "Invalid selection"
+            )
+            return
+
+        if state.get("busy"):
+            await event.answer(
+                "Previous request still running."
+            )
             return
 
         field = {
@@ -445,25 +888,46 @@ async def callback_handler(event):
         }[step]
 
         try:
-            index = int(data.split(":")[1])
+            index = int(
+                data.split(":", 1)[1]
+            )
+
             item = state[field][index]
+
         except (ValueError, IndexError):
-            await event.answer("Invalid index")
+            await event.answer(
+                "Invalid selection"
+            )
             return
 
         await event.answer()
 
         if step == "goal":
+            state["busy"] = True
             state["goal"] = item
-            await event.respond("🔎 Finding packs...")
+
+            await event.respond(
+                "🔎 Finding packs..."
+            )
 
             try:
-                result = await batches(PROFILE, item)
+                async with catalog_lock:
+                    result = await batches(
+                        BROWSE_PROFILE,
+                        item,
+                    )
+
             except Exception as error:
                 await event.respond(
                     "Pack discovery failed:\n"
                     + clean_error(error)
                 )
+                return
+
+            finally:
+                state["busy"] = False
+
+            if menus.get(OWNER) is not state:
                 return
 
             if not result:
@@ -478,20 +942,38 @@ async def callback_handler(event):
                 "page": 0,
             })
 
-            await show_menu(event, state)
+            await show_menu(
+                event,
+                state,
+            )
             return
 
         if step == "pack":
+            state["busy"] = True
             state["pack"] = item
-            await event.respond("🔎 Finding subjects...")
+
+            await event.respond(
+                "🔎 Finding subjects..."
+            )
 
             try:
-                result = await subjects(PROFILE, item)
+                async with catalog_lock:
+                    result = await subjects(
+                        BROWSE_PROFILE,
+                        item,
+                    )
+
             except Exception as error:
                 await event.respond(
                     "Subject discovery failed:\n"
                     + clean_error(error)
                 )
+                return
+
+            finally:
+                state["busy"] = False
+
+            if menus.get(OWNER) is not state:
                 return
 
             if not result:
@@ -506,27 +988,45 @@ async def callback_handler(event):
                 "page": 0,
             })
 
-            await show_menu(event, state)
+            await show_menu(
+                event,
+                state,
+            )
             return
 
         if step == "subjects":
             state["chosen"] = [item]
-            await confirm(event, state)
+
+            await confirm(
+                event,
+                state,
+            )
             return
 
     if data == "select:all":
         if state["step"] != "subjects":
-            await event.answer("Invalid step")
+            await event.answer(
+                "Invalid step"
+            )
             return
 
         await event.answer()
+
         state["chosen"] = state["subjects"]
-        await confirm(event, state)
+
+        await confirm(
+            event,
+            state,
+        )
         return
 
     if data == "confirm:no":
         menus.pop(OWNER, None)
-        await event.answer("Cancelled")
+
+        await event.answer(
+            "Cancelled"
+        )
+
         await event.respond(
             "Cancelled. Send /start again."
         )
@@ -534,8 +1034,14 @@ async def callback_handler(event):
 
     if data == "confirm:yes":
         if state["step"] != "confirm":
-            await event.answer("Invalid step")
+            await event.answer(
+                "Invalid step"
+            )
             return
+
+        # Immediately prevent the same YES button
+        # from queuing duplicate jobs.
+        state["step"] = "queued"
 
         payload = {
             "goal": state["goal"],
@@ -544,48 +1050,106 @@ async def callback_handler(event):
         }
 
         cursor = sql.execute(
-            "INSERT INTO jobs(payload,status) "
-            "VALUES(?, 'queued')",
-            (json.dumps(payload),),
+            """
+            INSERT INTO jobs(payload,status)
+            VALUES(?, 'queued')
+            """,
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                ),
+            ),
         )
+
         sql.commit()
 
         menus.pop(OWNER, None)
 
-        await event.answer("Queued")
+        await event.answer(
+            "Queued"
+        )
+
         await event.respond(
             f"✅ Job #{cursor.lastrowid} queued.\n"
-            "Use /status for progress."
+            "Download ke waqt bhi /start, "
+            "/status aur /queue use kar sakte ho."
         )
         return
 
-    await event.answer("Unknown action")
+    await event.answer(
+        "Unknown action"
+    )
 
 
-async def process_job(job_id, payload):
+# ==========================================
+# JOB PROCESSING
+# ==========================================
+
+async def wait_if_paused():
+    while paused and not cancel_requested:
+        await asyncio.sleep(1)
+
+
+async def process_job(
+    job_id,
+    payload,
+):
     global cancel_requested
 
     done = 0
     errors = 0
 
+    activity["done"] = 0
+    activity["errors"] = 0
+
     for subject in payload["subjects"]:
         if cancel_requested:
             break
 
-        while paused and not cancel_requested:
-            await asyncio.sleep(2)
+        await wait_if_paused()
 
-        activity["stage"] = "Discovering classes"
+        if cancel_requested:
+            break
+
+        set_activity(
+            stage="Discovering classes",
+            detail="Opening subject",
+            percent=0,
+            lecture="",
+            subject=subject["name"],
+            job_id=job_id,
+        )
+
+        await live(
+            force=True
+        )
 
         try:
             lectures, total = await classes(
-                PROFILE, subject
+                DOWNLOAD_PROFILE,
+                subject,
             )
+
         except Exception as error:
             errors += 1
+
+            activity["errors"] = errors
+
+            update_job_counts(
+                job_id,
+                done,
+                errors,
+            )
+
+            logging.exception(
+                "Subject discovery failed"
+            )
+
             await notify(
                 "❌ Subject discovery failed:\n"
-                + subject["name"] + "\n"
+                + subject["name"]
+                + "\n"
                 + clean_error(error)
             )
             continue
@@ -600,47 +1164,70 @@ async def process_job(job_id, payload):
             if cancel_requested:
                 break
 
-            while paused and not cancel_requested:
-                await asyncio.sleep(2)
+            await wait_if_paused()
+
+            if cancel_requested:
+                break
 
             key = (
-                payload["goal"]["uid"] + ":"
-                + payload["pack"]["uid"] + ":"
-                + subject["uid"] + ":"
+                payload["goal"]["uid"]
+                + ":"
+                + payload["pack"]["uid"]
+                + ":"
+                + subject["uid"]
+                + ":"
                 + str(lecture["class_number"])
             )
 
             if storage.completed(key):
                 done += 1
+
+                activity["done"] = done
+
+                update_job_counts(
+                    job_id,
+                    done,
+                    errors,
+                )
                 continue
 
-            activity["lecture"] = lecture["title"]
+            set_activity(
+                stage="Downloading",
+                detail="Starting lecture",
+                percent=0,
+                lecture=lecture["title"],
+                subject=subject["name"],
+                job_id=job_id,
+            )
 
             async def dl_progress(kind, percent):
-                await live(
-                    f"📥 Downloading\n"
-                    f"{lecture['title'][:80]}\n"
-                    f"{kind}: {percent:.1f}%"
+                set_activity(
+                    stage="Downloading",
+                    detail=kind,
+                    percent=percent,
                 )
+
+                await live()
 
             async def up_progress(filename, percent):
-                await live(
-                    f"📤 Uploading\n"
-                    f"{lecture['title'][:80]}\n"
-                    f"{filename}: {percent:.1f}%"
+                set_activity(
+                    stage="Uploading",
+                    detail=filename,
+                    percent=percent,
                 )
+
+                await live()
+
+            await live(
+                force=True
+            )
 
             try:
-                activity["stage"] = "Downloading"
-
-                await live(
-                    f"📥 Starting\n"
-                    f"{lecture['title']}",
-                    force=True,
-                )
-
+                # The safe downloader streams to disk.
+                # No second heavy download starts
+                # until this lecture is finished.
                 folder, manifest = await download_lecture(
-                    PROFILE,
+                    DOWNLOAD_PROFILE,
                     FILES,
                     subject,
                     lecture,
@@ -648,7 +1235,15 @@ async def process_job(job_id, payload):
                     dl_progress,
                 )
 
-                activity["stage"] = "Uploading"
+                set_activity(
+                    stage="Uploading",
+                    detail="Telegram",
+                    percent=0,
+                )
+
+                await live(
+                    force=True
+                )
 
                 await storage.upload(
                     tg,
@@ -670,34 +1265,53 @@ async def process_job(job_id, payload):
 
                 done += 1
 
-                await live(
-                    f"✅ Uploaded: {lecture['title']}\n"
-                    f"Done: {done} | Errors: {errors}",
-                    force=True,
+                activity["done"] = done
+
+                set_activity(
+                    stage="Lecture completed",
+                    detail="Saved in MongoDB",
+                    percent=100,
                 )
+
+                await live(
+                    force=True
+                )
+
+            except asyncio.CancelledError:
+                raise
 
             except Exception as error:
                 errors += 1
-                logging.exception("Lecture failure")
+
+                activity["errors"] = errors
+
+                logging.exception(
+                    "Lecture failure"
+                )
 
                 await notify(
-                    f"🚨 Lecture failed\n"
+                    "🚨 Lecture failed\n"
                     f"Subject: {subject['name']}\n"
                     f"Class: {lecture['class_number']}\n"
                     f"Error: {clean_error(error)}"
                 )
 
-            sql.execute(
-                "UPDATE jobs SET done=?,errors=? WHERE id=?",
-                (done, errors, job_id),
+            update_job_counts(
+                job_id,
+                done,
+                errors,
             )
-            sql.commit()
 
     return done, errors
 
 
+# ==========================================
+# BACKGROUND WORKER
+# ==========================================
+
 async def worker():
     global cancel_requested
+    global progress_message
 
     while True:
         try:
@@ -706,56 +1320,102 @@ async def worker():
                 continue
 
             job = sql.execute(
-                "SELECT id,payload FROM jobs "
-                "WHERE status='queued' "
-                "ORDER BY id LIMIT 1"
+                """
+                SELECT id,payload
+                FROM jobs
+                WHERE status='queued'
+                ORDER BY id
+                LIMIT 1
+                """
             ).fetchone()
 
             if not job:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 continue
 
             job_id, raw = job
+
             cancel_requested = False
+            progress_message = None
+
+            activity.update({
+                "job_id": job_id,
+                "stage": "Starting job",
+                "detail": "",
+                "subject": "",
+                "lecture": "",
+                "percent": 0,
+                "done": 0,
+                "errors": 0,
+                "started": time.monotonic(),
+                "last_progress": time.monotonic(),
+            })
 
             sql.execute(
-                "UPDATE jobs SET status='running' "
-                "WHERE id=?",
+                """
+                UPDATE jobs
+                SET status='running'
+                WHERE id=?
+                """,
                 (job_id,),
             )
+
             sql.commit()
+
+            await live(
+                force=True
+            )
 
             try:
                 done, errors = await process_job(
-                    job_id, json.loads(raw)
+                    job_id,
+                    json.loads(raw),
                 )
 
-                result = (
-                    "cancelled" if cancel_requested
-                    else "completed_with_errors" if errors
-                    else "completed"
-                )
+                if cancel_requested:
+                    result = "cancelled"
+
+                elif errors:
+                    result = "completed_with_errors"
+
+                else:
+                    result = "completed"
 
                 sql.execute(
-                    "UPDATE jobs SET status=? WHERE id=?",
+                    """
+                    UPDATE jobs
+                    SET status=?
+                    WHERE id=?
+                    """,
                     (result, job_id),
                 )
+
                 sql.commit()
 
                 await notify(
                     f"🏁 Job #{job_id}\n"
-                    f"Done: {done}\nErrors: {errors}\n"
+                    f"Done: {done}\n"
+                    f"Errors: {errors}\n"
                     f"Status: {result}"
                 )
 
+            except asyncio.CancelledError:
+                raise
+
             except Exception as error:
-                logging.exception("Job error")
+                logging.exception(
+                    "Job failed"
+                )
 
                 sql.execute(
-                    "UPDATE jobs SET status='failed' "
-                    "WHERE id=?",
+                    """
+                    UPDATE jobs
+                    SET status='failed'
+                    WHERE id=?
+                    """,
                     (job_id,),
                 )
+
                 sql.commit()
 
                 await notify(
@@ -763,32 +1423,64 @@ async def worker():
                     + clean_error(error)
                 )
 
-            activity["stage"] = "Idle"
+            finally:
+                activity["stage"] = "Idle"
+                activity["detail"] = ""
+                activity["lecture"] = ""
+                activity["percent"] = 0
+                activity["job_id"] = None
+
+                progress_message = None
 
         except asyncio.CancelledError:
             raise
+
         except Exception:
-            logging.exception("Worker crash")
+            logging.exception(
+                "Background worker crashed"
+            )
+
             await asyncio.sleep(5)
 
 
+# ==========================================
+# MAIN
+# ==========================================
+
 async def main():
-    await tg.start(bot_token=os.environ["BOT_TOKEN"])
+    await tg.start(
+        bot_token=os.environ["BOT_TOKEN"]
+    )
 
     await notify(
         "✅ Lecture Manager started\n"
+        "Live progress enabled.\n"
+        "Browsing available during downloads.\n"
+        "Active download limit: 1\n\n"
         "Send /start"
     )
 
-    task = asyncio.create_task(worker())
+    worker_task = asyncio.create_task(
+        worker()
+    )
+
+    heartbeat_task = asyncio.create_task(
+        heartbeat()
+    )
 
     try:
         await tg.run_until_disconnected()
+
     finally:
-        task.cancel()
+        worker_task.cancel()
+        heartbeat_task.cancel()
+
         await asyncio.gather(
-            task, return_exceptions=True
+            worker_task,
+            heartbeat_task,
+            return_exceptions=True,
         )
+
         sql.close()
         storage.close()
 

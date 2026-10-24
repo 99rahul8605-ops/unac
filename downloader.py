@@ -2,7 +2,9 @@
 import asyncio
 import hashlib
 import json
+import os
 import re
+import shutil
 import time
 import zipfile
 
@@ -11,81 +13,475 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from catalog import (
-    BASE,
-    start_browser,
-    stop_browser,
-    load,
+from catalog import BASE, start_browser, load
+
+# One active lecture transfer per bot process.
+# Other asynchronous bot handlers may keep running.
+DOWNLOAD_LOCK = asyncio.Semaphore(1)
+
+MIN_FREE_RAM_MB = int(os.getenv("UNAC_MIN_FREE_RAM_MB", "650"))
+MIN_FREE_DISK_MB = int(os.getenv("UNAC_MIN_FREE_DISK_MB", "768"))
+DISK_RESERVE_MB = 256
+MAX_ASSET_MB = 100
+CHUNK_SIZE = 512 * 1024
+
+VIDEO_PATTERN = re.compile(
+    r"\.(mp4|webm)(?:\?|$)", re.I
 )
 
 
-def walk_urls(value):
-    found = set()
+def memory_available_mb():
+    root = Path("/sys/fs/cgroup")
 
-    def walk(item, depth=0):
-        if depth > 50:
-            return
+    try:
+        maximum = (root / "memory.max").read_text().strip()
 
-        if isinstance(item, list):
-            for value in item:
-                walk(value, depth + 1)
+        if maximum != "max":
+            current = int(
+                (root / "memory.current").read_text().strip()
+            )
 
-        elif isinstance(item, dict):
-            url = item.get("u")
+            inactive = 0
+            stat = root / "memory.stat"
 
-            if (
-                isinstance(url, str)
-                and url.startswith("https://")
-            ):
-                found.add(url)
+            if stat.exists():
+                for line in stat.read_text().splitlines():
+                    if line.startswith("inactive_file "):
+                        inactive = int(line.split()[1])
+                        break
 
-            for value in item.values():
-                walk(value, depth + 1)
+            available = int(maximum) - max(0, current - inactive)
+            return max(0, available // (1024 * 1024))
+    except (OSError, ValueError):
+        pass
 
-    walk(value)
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
 
-    return sorted(found)
+    return None
+
+
+def check_resources(folder, browser=False):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    free_disk = shutil.disk_usage(folder).free // (1024 * 1024)
+
+    if free_disk < MIN_FREE_DISK_MB:
+        raise RuntimeError(
+            f"Low disk space: {free_disk} MB free. "
+            f"Need at least {MIN_FREE_DISK_MB} MB."
+        )
+
+    if browser:
+        ram = memory_available_mb()
+
+        if ram is not None and ram < MIN_FREE_RAM_MB:
+            raise RuntimeError(
+                f"Low available RAM: {ram} MB. "
+                "Browser not started to avoid VPS OOM."
+            )
+
+
+def ensure_disk_reserve(folder):
+    free = shutil.disk_usage(folder).free // (1024 * 1024)
+
+    if free < DISK_RESERVE_MB:
+        raise RuntimeError(
+            "Low disk space; download paused safely. "
+            f"Only {free} MB free."
+        )
+
+
+def is_video_url(url):
+    return (
+        "/api/public/v/" in url
+        or bool(VIDEO_PATTERN.search(url))
+    )
 
 
 def count_board_events(value):
     count = 0
+    stack = [(value, 0)]
 
-    def walk(item, depth=0):
-        nonlocal count
+    while stack:
+        item, depth = stack.pop()
 
         if depth > 50:
-            return
+            continue
 
         if isinstance(item, list):
-            for value in item:
-                walk(value, depth + 1)
+            stack.extend((x, depth + 1) for x in item)
 
         elif isinstance(item, dict):
             if "plugin" in item and "p_time" in item:
                 count += 1
 
-            for value in item.values():
-                walk(value, depth + 1)
-
-    walk(value)
+            stack.extend(
+                (x, depth + 1) for x in item.values()
+            )
 
     return count
 
 
-async def safe_progress(callback, stage, percent):
-    if callback is None:
-        return
+def walk_urls(value):
+    found = set()
+    stack = [(value, 0)]
+
+    while stack:
+        item, depth = stack.pop()
+
+        if depth > 50:
+            continue
+
+        if isinstance(item, list):
+            stack.extend((x, depth + 1) for x in item)
+
+        elif isinstance(item, dict):
+            url = item.get("u")
+
+            if isinstance(url, str) and url.startswith("https://"):
+                found.add(url)
+
+            stack.extend(
+                (x, depth + 1) for x in item.values()
+            )
+
+    return sorted(found)
+
+
+def choose_board(folder, candidates):
+    main = folder / "board.json"
+    paths = list(candidates)
+
+    if main.exists():
+        paths.append(main)
+
+    best_path = None
+    best_count = 0
+    best_urls = []
+
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            count = count_board_events(data)
+
+            if count > best_count:
+                best_path = path
+                best_count = count
+                best_urls = walk_urls(data)
+
+            del data
+
+        except (OSError, ValueError, TypeError):
+            continue
+
+    if best_path is None:
+        raise RuntimeError(
+            "Board JSON not received or invalid."
+        )
+
+    if best_path != main:
+        best_path.replace(main)
+
+    for path in candidates:
+        if path != main:
+            path.unlink(missing_ok=True)
+
+    return best_count, best_urls
+
+
+def cookies_for(url, browser_cookies):
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    result = {}
+
+    for cookie in browser_cookies:
+        domain = cookie.get("domain", "").lstrip(".").lower()
+        path = cookie.get("path", "/")
+
+        if not domain:
+            continue
+
+        if host != domain and not host.endswith("." + domain):
+            continue
+
+        if not parsed.path.startswith(path):
+            continue
+
+        if cookie.get("secure") and parsed.scheme != "https":
+            continue
+
+        result[cookie["name"]] = cookie["value"]
+
+    return result
+
+
+class Progress:
+    def __init__(self, callback):
+        self.callback = callback
+        self.stage = None
+        self.last_time = 0
+        self.last_percent = -1
+
+    async def send(self, stage, percent=0, force=False):
+        percent = max(0, min(100, float(percent)))
+        now = time.monotonic()
+
+        changed = stage != self.stage
+
+        if (
+            not force
+            and not changed
+            and now - self.last_time < 4
+            and abs(percent - self.last_percent) < 5
+        ):
+            return
+
+        self.stage = stage
+        self.last_time = now
+        self.last_percent = percent
+
+        print(
+            f"[DOWNLOAD] {stage}: {percent:.1f}%",
+            flush=True,
+        )
+
+        if self.callback:
+            try:
+                await asyncio.wait_for(
+                    self.callback(stage, percent),
+                    timeout=8,
+                )
+            except Exception as e:
+                print(
+                    "Progress callback:",
+                    type(e).__name__,
+                    flush=True,
+                )
+
+
+async def close_browser(pw, context):
+    # Avoid indefinitely hanging while disposing
+    # Playwright request contexts.
+    try:
+        await asyncio.wait_for(
+            context.close(),
+            timeout=12,
+        )
+    except Exception as e:
+        print(
+            "Browser close:",
+            type(e).__name__,
+            flush=True,
+        )
 
     try:
-        await callback(
-            stage,
-            min(100, max(0, percent)),
+        await asyncio.wait_for(
+            pw.stop(),
+            timeout=8,
         )
-    except Exception as error:
-        print(
-            "Progress notification failed:",
-            type(error).__name__,
+    except Exception:
+        pass
+
+
+async def capture_sources(
+    profile,
+    folder,
+    lecture,
+    progress,
+):
+    check_resources(folder, browser=True)
+
+    pw, context = await start_browser(profile)
+
+    candidates = []
+    board_tasks = set()
+    video_urls = []
+    board_number = 0
+    user_agent = None
+    referer = BASE + "/"
+    cookies = []
+
+    async def save_board(response, path):
+        try:
+            raw = await response.body()
+
+            if not raw:
+                return
+
+            if len(raw) > 80 * 1024 * 1024:
+                raise RuntimeError(
+                    "Board response too large"
+                )
+
+            await asyncio.to_thread(
+                path.write_bytes,
+                raw,
+            )
+            candidates.append(path)
+
+        except Exception as e:
+            print(
+                "Board capture:",
+                type(e).__name__,
+                flush=True,
+            )
+
+    def on_request(request):
+        if is_video_url(request.url):
+            if request.url not in video_urls:
+                video_urls.append(request.url)
+
+    def on_response(response):
+        nonlocal board_number
+
+        if "/api/public/board/" not in response.url:
+            return
+
+        board_number += 1
+        path = folder / (
+            f".board_capture_{board_number}.json"
         )
+
+        task = asyncio.create_task(
+            save_board(response, path)
+        )
+
+        board_tasks.add(task)
+        task.add_done_callback(board_tasks.discard)
+
+    async def route_handler(route):
+        request = route.request
+
+        try:
+            # Stop Chromium from transferring a second
+            # copy of the large lecture video.
+            if is_video_url(request.url):
+                if request.url not in video_urls:
+                    video_urls.append(request.url)
+
+                await route.abort()
+                return
+
+            # Reduce browser memory and bandwidth.
+            if request.resource_type in ("image", "font"):
+                await route.abort()
+                return
+
+            await route.continue_()
+
+        except Exception:
+            pass
+
+    try:
+        context.on("request", on_request)
+        context.on("response", on_response)
+
+        await context.route(
+            "**/*",
+            route_handler,
+        )
+
+        page = (
+            context.pages[0]
+            if context.pages
+            else await context.new_page()
+        )
+
+        await progress.send("Preparing", 0, force=True)
+
+        await load(
+            page,
+            lecture["watch_url"],
+        )
+
+        await progress.send("Loading player", 0, force=True)
+
+        try:
+            await page.locator("video").first.evaluate(
+                """v => {
+                    v.preload = 'metadata';
+                    v.load();
+                }""",
+                timeout=6000,
+            )
+        except Exception:
+            pass
+
+        # Wait for metadata only, not the entire video.
+        for attempt in range(60):
+            if video_urls and (
+                candidates
+                or (folder / "board.json").exists()
+            ):
+                break
+
+            if attempt % 10 == 0:
+                print(
+                    "[DOWNLOAD] Waiting for media metadata:",
+                    attempt // 2,
+                    "seconds",
+                    flush=True,
+                )
+
+            await asyncio.sleep(0.5)
+
+        if board_tasks:
+            await asyncio.wait(
+                board_tasks,
+                timeout=10,
+            )
+
+        if not video_urls:
+            source = await page.evaluate(
+                """() =>
+                    document.querySelector('video')?.currentSrc
+                    || document.querySelector('video')?.src
+                    || null
+                """
+            )
+
+            if (
+                source
+                and source.startswith(("https://", "http://"))
+            ):
+                video_urls.append(source)
+
+        user_agent = await page.evaluate(
+            "navigator.userAgent"
+        )
+
+        referer = page.url
+        cookies = await context.cookies()
+
+    finally:
+        # Critical: browser closes BEFORE video download.
+        await close_browser(pw, context)
+
+    if not video_urls:
+        raise RuntimeError(
+            "Video source not found on lecture page."
+        )
+
+    if not candidates and not (folder / "board.json").exists():
+        raise RuntimeError(
+            "Board source not found on lecture page."
+        )
+
+    return (
+        video_urls[-1],
+        candidates,
+        user_agent,
+        referer,
+        cookies,
+    )
 
 
 async def download_video(
@@ -93,53 +489,71 @@ async def download_video(
     target,
     headers,
     progress,
+    browser_cookies=None,
 ):
     target = Path(target)
-    partial = Path(str(target) + ".part")
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     if target.exists() and target.stat().st_size > 0:
-        await safe_progress(progress, "Video", 100)
+        await progress.send("Video", 100, force=True)
         return
+
+    partial = Path(str(target) + ".part")
+    meta = Path(str(target) + ".part.sha256")
+
+    signature = hashlib.sha256(
+        url.encode("utf-8")
+    ).hexdigest()
+
+    # Do not combine fragments from different signed URLs.
+    if partial.exists():
+        previous = (
+            meta.read_text().strip()
+            if meta.exists()
+            else ""
+        )
+
+        if previous != signature:
+            partial.unlink(missing_ok=True)
+
+    meta.write_text(signature)
 
     timeout = aiohttp.ClientTimeout(
         total=None,
-        sock_connect=60,
-        sock_read=180,
+        sock_connect=30,
+        sock_read=90,
     )
 
-    last_update = 0.0
-    last_percent = -1
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=aiohttp.TCPConnector(limit=2),
+    ) as session:
 
-    for attempt in range(4):
-        start = (
-            partial.stat().st_size
-            if partial.exists()
-            else 0
-        )
-
-        request_headers = dict(headers)
-
-        if start:
-            request_headers["Range"] = (
-                f"bytes={start}-"
+        for attempt in range(4):
+            start = (
+                partial.stat().st_size
+                if partial.exists()
+                else 0
             )
 
-        try:
-            async with aiohttp.ClientSession(
-                timeout=timeout
-            ) as session:
+            request_headers = dict(headers)
 
+            if start:
+                request_headers["Range"] = f"bytes={start}-"
+
+            try:
                 async with session.get(
                     url,
                     headers=request_headers,
-                    allow_redirects=True,
+                    cookies=cookies_for(
+                        url,
+                        browser_cookies or [],
+                    ),
                 ) as response:
 
                     if response.status == 416:
-                        if partial.exists():
-                            partial.unlink()
                         raise RuntimeError(
-                            "Invalid saved range; restarting"
+                            "Resume range rejected"
                         )
 
                     if response.status not in (200, 206):
@@ -147,7 +561,17 @@ async def download_video(
                             f"Video HTTP {response.status}"
                         )
 
-                    append = (
+                    content_type = response.headers.get(
+                        "Content-Type",
+                        "",
+                    ).lower()
+
+                    if "text/html" in content_type:
+                        raise RuntimeError(
+                            "HTML returned instead of video"
+                        )
+
+                    resume = (
                         start > 0
                         and response.status == 206
                     )
@@ -157,52 +581,45 @@ async def download_video(
                         "",
                     )
 
-                    match = re.search(
+                    match = re.fullmatch(
                         r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
-                        content_range,
+                        content_range.strip(),
                     )
 
-                    if append:
-                        if (
-                            not match
-                            or int(match.group(1)) != start
-                        ):
-                            if partial.exists():
-                                partial.unlink()
+                    if resume and (
+                        not match
+                        or int(match.group(1)) != start
+                    ):
+                        partial.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            "Invalid resume response"
+                        )
 
-                            raise RuntimeError(
-                                "Invalid resume response"
-                            )
+                    if response.status == 206 and not resume:
+                        raise RuntimeError(
+                            "Unexpected partial response"
+                        )
 
-                    offset = start if append else 0
+                    offset = start if resume else 0
 
-                    length_header = response.headers.get(
+                    length = response.headers.get(
                         "Content-Length"
                     )
 
-                    content_length = (
-                        int(length_header)
-                        if length_header
-                        else None
-                    )
-
-                    if (
-                        match
-                        and match.group(3) != "*"
-                    ):
+                    if match and match.group(3) != "*":
                         expected = int(match.group(3))
-                    elif content_length is not None:
-                        expected = offset + content_length
+                    elif length:
+                        expected = offset + int(length)
                     else:
                         expected = None
 
                     received = offset
-
-                    mode = "ab" if append else "wb"
+                    last_disk_check = offset
+                    mode = "ab" if resume else "wb"
 
                     with partial.open(mode) as output:
                         async for chunk in response.content.iter_chunked(
-                            1024 * 1024
+                            CHUNK_SIZE
                         ):
                             if not chunk:
                                 continue
@@ -210,61 +627,137 @@ async def download_video(
                             output.write(chunk)
                             received += len(chunk)
 
-                            now = time.monotonic()
+                            if received - last_disk_check >= 16 * 1024 * 1024:
+                                ensure_disk_reserve(target.parent)
+                                last_disk_check = received
 
-                            percent = (
-                                received * 100 / expected
-                                if expected
-                                else 0
+                            if expected:
+                                await progress.send(
+                                    "Video",
+                                    100 * received / expected,
+                                )
+                            else:
+                                await progress.send("Video", 0)
+
+                actual = partial.stat().st_size
+
+                if expected is not None and actual != expected:
+                    raise RuntimeError(
+                        f"Incomplete video: {actual}/{expected}"
+                    )
+
+                if actual == 0:
+                    raise RuntimeError("Empty video")
+
+                partial.replace(target)
+                meta.unlink(missing_ok=True)
+
+                await progress.send(
+                    "Video",
+                    100,
+                    force=True,
+                )
+                return
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as e:
+                print(
+                    f"Video attempt {attempt + 1}:",
+                    type(e).__name__,
+                    str(e)[:100],
+                    flush=True,
+                )
+
+                if isinstance(e, RuntimeError) and (
+                    "Resume range rejected" in str(e)
+                    or "Invalid resume response" in str(e)
+                ):
+                    partial.unlink(missing_ok=True)
+
+                if attempt == 3:
+                    raise
+
+                await asyncio.sleep(3 * (attempt + 1))
+
+
+async def download_asset(
+    session,
+    url,
+    destination,
+    headers,
+    cookies,
+):
+    partial = Path(str(destination) + ".part")
+
+    for attempt in range(3):
+        try:
+            partial.unlink(missing_ok=True)
+
+            async with session.get(
+                url,
+                headers=headers,
+                cookies=cookies_for(url, cookies),
+            ) as response:
+
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"Asset HTTP {response.status}"
+                    )
+
+                length = response.content_length
+
+                if length and length > MAX_ASSET_MB * 1024 * 1024:
+                    raise RuntimeError(
+                        "Asset exceeds safety size limit"
+                    )
+
+                received = 0
+                first = True
+
+                with partial.open("wb") as output:
+                    async for chunk in response.content.iter_chunked(
+                        CHUNK_SIZE
+                    ):
+                        if first:
+                            first = False
+
+                            if chunk[:200].lstrip().lower().startswith(
+                                (b"<!doctype", b"<html")
+                            ):
+                                raise RuntimeError(
+                                    "HTML returned instead of asset"
+                                )
+
+                        received += len(chunk)
+
+                        if received > MAX_ASSET_MB * 1024 * 1024:
+                            raise RuntimeError(
+                                "Asset exceeds safety size limit"
                             )
 
-                            # Avoid thousands of Telegram
-                            # progress messages for large videos.
-                            if (
-                                expected
-                                and (
-                                    now - last_update >= 3
-                                    or percent - last_percent >= 5
-                                )
-                            ):
-                                await safe_progress(
-                                    progress,
-                                    "Video",
-                                    percent,
-                                )
+                        if not chunk:
+                            continue
 
-                                last_update = now
-                                last_percent = percent
+                        output.write(chunk)
 
-            size = partial.stat().st_size
+            if received == 0:
+                raise RuntimeError("Empty asset")
 
-            if not size:
-                raise RuntimeError(
-                    "Empty video download"
-                )
-
-            if expected is not None and size != expected:
-                raise RuntimeError(
-                    f"Incomplete video: {size}/{expected}"
-                )
-
-            partial.replace(target)
-
-            await safe_progress(
-                progress,
-                "Video",
-                100,
-            )
+            partial.replace(destination)
             return
 
         except asyncio.CancelledError:
             raise
 
         except Exception:
-            if attempt == 3:
+            partial.unlink(missing_ok=True)
+
+            if attempt == 2:
                 raise
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
 
 async def download_lecture(
@@ -275,185 +768,89 @@ async def download_lecture(
     key,
     progress=None,
 ):
-    folder = Path(root) / hashlib.sha256(
-        key.encode("utf-8")
-    ).hexdigest()[:20]
+    async with DOWNLOAD_LOCK:
+        folder = Path(root) / hashlib.sha256(
+            key.encode("utf-8")
+        ).hexdigest()[:20]
 
-    folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+        folder.mkdir(parents=True, exist_ok=True)
 
-    pw, context = await start_browser(profile)
+        reporter = Progress(progress)
 
-    try:
-        page = (
-            context.pages[0]
-            if context.pages
-            else await context.new_page()
+        await reporter.send(
+            "Checking resources",
+            0,
+            force=True,
         )
 
-        video_url = None
-        board = None
-        tasks = set()
+        check_resources(folder, browser=True)
 
-        async def parse_board(response):
-            nonlocal board
-
-            try:
-                data = await response.json()
-
-                events = count_board_events(data)
-
-                if events > 0:
-                    if (
-                        board is None
-                        or events > count_board_events(board)
-                    ):
-                        board = data
-
-            except Exception:
-                pass
-
-        def received(response):
-            nonlocal video_url
-
-            url = response.url
-
-            if (
-                "/api/public/v/" in url
-                or re.search(
-                    r"\.(mp4|webm)(\?|$)",
-                    url,
-                    re.I,
-                )
-            ):
-                video_url = url
-
-            if "/api/public/board/" in url:
-                task = asyncio.create_task(
-                    parse_board(response)
-                )
-
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-
-        context.on("response", received)
-
-        # The lecture URL comes from the website's
-        # Watch class link discovered by catalog.py.
-        await load(
-            page,
-            lecture["watch_url"],
-        )
-
-        await page.wait_for_timeout(3500)
-
-        try:
-            await page.locator("video").first.evaluate(
-                """video => {
-                    video.preload = 'auto';
-                    video.load();
-                }"""
-            )
-        except Exception:
-            pass
-
-        # Give video and board requests an opportunity
-        # to finish instead of relying only on one delay.
-        for _ in range(40):
-            if video_url and board is not None:
-                break
-
-            await asyncio.sleep(0.5)
-
-        if tasks:
-            await asyncio.gather(
-                *list(tasks),
-                return_exceptions=True,
-            )
-
-        if not video_url:
-            video_url = await page.evaluate(
-                """() => {
-                    const video = document.querySelector('video');
-
-                    return video?.currentSrc
-                        || video?.src
-                        || null;
-                }"""
-            )
-
-        if not video_url:
-            raise RuntimeError(
-                "Video URL unavailable on lecture page"
-            )
-
-        if board is None:
-            raise RuntimeError(
-                "Board JSON unavailable on lecture page"
-            )
-
-        event_count = count_board_events(board)
-
-        if event_count == 0:
-            raise RuntimeError(
-                "Board JSON has no recognized events"
-            )
-
-        (folder / "board.json").write_text(
-            json.dumps(
-                board,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        extension = (
-            ".mp4"
-            if urlparse(video_url).path.lower().endswith(
-                ".mp4"
-            )
-            else ".webm"
-        )
-
-        cookies = await context.cookies(
-            video_url
-        )
-
-        headers = {
-            "User-Agent": await page.evaluate(
-                "navigator.userAgent"
-            ),
-            "Referer": page.url,
-            "Accept-Encoding": "identity",
-        }
-
-        if cookies:
-            headers["Cookie"] = "; ".join(
-                cookie["name"]
-                + "="
-                + cookie["value"]
-                for cookie in cookies
-            )
-
-        await download_video(
+        (
             video_url,
-            folder / ("video" + extension),
-            headers,
-            progress,
+            candidates,
+            user_agent,
+            referer,
+            browser_cookies,
+        ) = await capture_sources(
+            profile,
+            folder,
+            lecture,
+            reporter,
         )
 
-        urls = walk_urls(board)
+        # Browser is already closed here.
+        await reporter.send(
+            "Board",
+            0,
+            force=True,
+        )
+
+        count, urls = await asyncio.to_thread(
+            choose_board,
+            folder,
+            candidates,
+        )
+
+        await reporter.send(
+            "Board",
+            100,
+            force=True,
+        )
 
         for field in (
             "annotated_pdf",
             "plain_pdf",
         ):
-            url = lecture.get(field)
+            value = lecture.get(field)
 
-            if url and url not in urls:
-                urls.append(url)
+            if value and value not in urls:
+                urls.append(value)
+
+        video_extension = (
+            ".mp4"
+            if urlparse(video_url).path.lower().endswith(".mp4")
+            else ".webm"
+        )
+
+        headers = {
+            "User-Agent": user_agent or "Mozilla/5.0",
+            "Referer": referer,
+            "Accept-Encoding": "identity",
+        }
+
+        await reporter.send(
+            "Video",
+            0,
+            force=True,
+        )
+
+        await download_video(
+            video_url,
+            folder / ("video" + video_extension),
+            headers,
+            reporter,
+            browser_cookies,
+        )
 
         assets_dir = folder / "assets"
         assets_dir.mkdir(exist_ok=True)
@@ -461,104 +858,80 @@ async def download_lecture(
         saved = []
         errors = []
 
-        total_assets = len(urls)
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=30,
+            sock_read=90,
+        )
 
-        for index, url in enumerate(urls, 1):
-            asset_extension = Path(
-                urlparse(url).path
-            ).suffix.lower()
+        await reporter.send(
+            "Assets",
+            0,
+            force=True,
+        )
 
-            if asset_extension not in {
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".webp",
-                ".pdf",
-            }:
-                asset_extension = ".bin"
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(limit=2),
+        ) as session:
 
-            filename = (
-                f"asset_{index:03d}"
-                + asset_extension
-            )
+            for index, url in enumerate(urls, 1):
+                suffix = Path(
+                    urlparse(url).path
+                ).suffix.lower()
 
-            destination = assets_dir / filename
+                if suffix not in {
+                    ".png", ".jpg", ".jpeg",
+                    ".webp", ".pdf",
+                }:
+                    suffix = ".bin"
 
-            try:
-                # Reuse a successfully downloaded
-                # asset after an interrupted job.
-                if (
-                    destination.exists()
-                    and destination.stat().st_size > 0
-                ):
-                    content = None
+                filename = f"asset_{index:03d}{suffix}"
+                destination = assets_dir / filename
 
-                else:
-                    response = await context.request.get(
+                url_hash = hashlib.sha256(
+                    url.encode("utf-8")
+                ).hexdigest()
+
+                try:
+                    ensure_disk_reserve(folder)
+
+                    await download_asset(
+                        session,
                         url,
-                        headers={
-                            "Referer": page.url,
-                        },
-                        timeout=120000,
+                        destination,
+                        headers,
+                        browser_cookies,
                     )
 
-                    if not response.ok:
-                        raise RuntimeError(
-                            f"Asset HTTP {response.status}"
-                        )
+                    saved.append({
+                        "filename": filename,
+                        "url_sha256": url_hash,
+                    })
 
-                    content = await response.body()
+                except asyncio.CancelledError:
+                    raise
 
-                    if not content:
-                        raise RuntimeError(
-                            "Empty asset"
-                        )
+                except Exception as e:
+                    errors.append({
+                        "asset": index,
+                        "error_type": type(e).__name__,
+                    })
 
-                    if content[:200].lstrip().lower().startswith(
-                        (
-                            b"<!doctype",
-                            b"<html",
-                        )
-                    ):
-                        raise RuntimeError(
-                            "HTML returned instead of asset"
-                        )
-
-                    destination.write_bytes(content)
-
-                saved.append({
-                    "filename": filename,
-                    "url_sha256": hashlib.sha256(
-                        url.encode("utf-8")
-                    ).hexdigest(),
-                })
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as error:
-                errors.append({
-                    "asset": index,
-                    "error_type": type(error).__name__,
-                })
-
-            await safe_progress(
-                progress,
-                "Assets",
-                index * 100 / max(total_assets, 1),
-            )
+                await reporter.send(
+                    "Assets",
+                    index * 100 / max(len(urls), 1),
+                )
 
         if errors:
             raise RuntimeError(
-                f"{len(errors)} assets failed; "
-                "partial files saved for retry"
+                f"{len(errors)} assets failed. "
+                "Completed video and board kept for retry."
             )
 
-        (folder / "asset_index.json").write_text(
-            json.dumps(
-                saved,
-                indent=2,
-            ),
+        asset_index = folder / "asset_index.json"
+        asset_index.write_text(
+            json.dumps(saved, indent=2),
             encoding="utf-8",
         )
 
@@ -567,8 +940,8 @@ async def download_lecture(
             "batch_uid": subject["uid"],
             "class_number": lecture["class_number"],
             "title": lecture["title"],
-            "video": "video" + extension,
-            "board_events": event_count,
+            "video": "video" + video_extension,
+            "board_events": count,
             "assets_saved": len(saved),
         }
 
@@ -581,15 +954,19 @@ async def download_lecture(
             encoding="utf-8",
         )
 
+        await reporter.send(
+            "Packaging",
+            0,
+            force=True,
+        )
+
         with zipfile.ZipFile(
             folder / "slides.zip",
             "w",
             zipfile.ZIP_DEFLATED,
         ) as archive:
 
-            for file in sorted(
-                assets_dir.iterdir()
-            ):
+            for file in sorted(assets_dir.iterdir()):
                 if file.is_file():
                     archive.write(
                         file,
@@ -597,14 +974,14 @@ async def download_lecture(
                     )
 
             archive.write(
-                folder / "asset_index.json",
+                asset_index,
                 "asset_index.json",
             )
 
-        return folder, manifest
-
-    finally:
-        await stop_browser(
-            pw,
-            context,
+        await reporter.send(
+            "Packaging",
+            100,
+            force=True,
         )
+
+        return folder, manifest
