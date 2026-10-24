@@ -1,13 +1,19 @@
 
+import asyncio
+import json
 import re
+import time
+from pathlib import Path
 from urllib.parse import urlparse
+
 from playwright.async_api import async_playwright
 
 BASE = "https://unacademy.hrvertex.workers.dev"
 
 GENERIC = re.compile(
     r"^(view classes|view details|view batch|view pack|"
-    r"explore|learn more|open|watch|join|enroll|details|back)$",
+    r"explore|learn more|open|watch|join|enroll|details|back)"
+    r"\s*[→➜➡]?$",
     re.I,
 )
 
@@ -16,15 +22,58 @@ def identifier(url):
     return urlparse(url).path.rstrip("/").split("/")[-1]
 
 
-async def start_browser(profile):
-    pw = await async_playwright().start()
+def _state_path(profile):
+    return Path(profile).parent / "catalog_navigation.json"
+
+
+def _read_state(profile):
     try:
-        ctx = await pw.chromium.launch_persistent_context(
+        return json.loads(_state_path(profile).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_state(profile, data):
+    path = _state_path(profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _remember(profile, rows):
+    state = _read_state(profile)
+
+    for item in rows:
+        key = item["type"] + ":" + item["uid"]
+        state[key] = {
+            **state.get(key, {}),
+            **item,
+        }
+
+    _write_state(profile, state)
+
+
+def _restore(profile, item):
+    key = item["type"] + ":" + item["uid"]
+    saved = _read_state(profile).get(key, {})
+    return {**saved, **item}
+
+
+async def start_browser(profile):
+    Path(profile).parent.mkdir(parents=True, exist_ok=True)
+    pw = await async_playwright().start()
+
+    try:
+        context = await pw.chromium.launch_persistent_context(
             str(profile),
             headless=True,
             args=["--no-sandbox"],
         )
-        return pw, ctx
+        return pw, context
     except Exception:
         await pw.stop()
         raise
@@ -43,25 +92,34 @@ async def load(page, url):
         wait_until="domcontentloaded",
         timeout=90000,
     )
-    await page.wait_for_timeout(2000)
+
+    await page.wait_for_timeout(1000)
 
     if await page.get_by_text(
-        "Verify you're human", exact=False
+        "Verify you're human",
+        exact=False,
     ).count():
-        raise RuntimeError("Website verification required")
+        raise RuntimeError(
+            "Website verification required. "
+            "Use an authorized browser session."
+        )
 
 
 async def close_popup(page):
     dialog = page.locator(
         '[role="dialog"][aria-modal="true"]'
     )
+
     if await dialog.count():
         close = dialog.get_by_role(
-            "button", name="Close", exact=True
+            "button",
+            name="Close",
+            exact=True,
         )
+
         try:
             if await close.count():
-                await close.first.click(timeout=3000)
+                await close.first.click(timeout=4000)
             else:
                 await page.keyboard.press("Escape")
         except Exception:
@@ -76,6 +134,8 @@ async def collect_links(page, route):
                 '^/(' + route + ')/([^/]+)/?$'
             );
 
+            const generic = /^(view classes|view details|view batch|view pack|explore|learn more|open|watch|join|enroll|details|back)\s*[→➜➡]?$/i;
+
             for (const a of document.querySelectorAll('a[href]')) {
                 const u = new URL(a.href);
                 if (u.origin !== location.origin) continue;
@@ -83,25 +143,26 @@ async def collect_links(page, route):
                 const match = u.pathname.match(pattern);
                 if (!match) continue;
 
-                const title = (a.innerText || '')
-                    .trim().replace(/\s+/g, ' ');
+                const lines = (a.innerText || '')
+                    .split('\n')
+                    .map(s => s.trim())
+                    .filter(Boolean);
 
-                const generic = /^(view classes|view details|view batch|view pack|explore|learn more|open|watch|join|enroll|details|back)$/i;
-
-                const valid = title.length >= 4 &&
-                    title.length <= 170 &&
-                    !generic.test(title);
+                const name = lines.find(x =>
+                    x.length >= 4 &&
+                    x.length <= 170 &&
+                    !generic.test(x)
+                ) || '';
 
                 const key = match[1] + ':' + match[2];
-                const old = found.get(key);
+                const existing = found.get(key);
 
-                if (!old || (valid && !old.valid)) {
+                if (!existing || (name && !existing.name)) {
                     found.set(key, {
                         uid: match[2],
                         type: match[1],
-                        name: valid ? title : '',
+                        name: name,
                         url: u.origin + u.pathname,
-                        valid: valid
                     });
                 }
             }
@@ -115,41 +176,57 @@ async def collect_links(page, route):
 def normalize(rows):
     return [
         {
-            "uid": x["uid"],
-            "type": x["type"],
-            "name": x["name"] or (
-                x["type"].title() + " — " + x["uid"]
+            "uid": item["uid"],
+            "type": item["type"],
+            "name": item["name"] or (
+                item["type"].title() + " — " + item["uid"]
             ),
-            "url": x["url"],
+            "url": item["url"],
         }
-        for x in rows
+        for item in rows
     ]
 
 
-# -------------------------------------------------
-# GOALS
-# -------------------------------------------------
+# ==================================================
+# GOAL DISCOVERY
+# ==================================================
 
 async def goals(profile, keyword):
     term = keyword.strip().lower()
 
-    is_ca = (
+    commerce = (
         term == "ca"
         or term.startswith("ca ")
-        or term in (
+        or term.startswith("cs ")
+        or term in {
             "commerce",
             "chartered accountant",
             "chartered accountants",
-        )
+            "cma",
+            "cfa",
+            "cs",
+            "cseet",
+        }
     )
 
     category_url = BASE + (
         "/?cat=comm&change=1"
-        if is_ca else "/?change=1"
+        if commerce
+        else "/?change=1"
     )
 
-    # Verified goal IDs.
-    known = {
+    cache_key = "goal_search:" + term
+    state = _read_state(profile)
+    cached = state.get(cache_key)
+
+    if (
+        cached
+        and time.time() - cached.get("time", 0) < 86400
+        and cached.get("items")
+    ):
+        return cached["items"]
+
+    verified = {
         "CA Foundation": "BBKWG",
         "CA Intermediate": "RXRWJ",
         "CA Final Group 1": "WKQWQ",
@@ -165,11 +242,7 @@ async def goals(profile, keyword):
             else await context.new_page()
         )
 
-        await page.goto(
-            category_url,
-            wait_until="domcontentloaded",
-            timeout=90000,
-        )
+        await load(page, category_url)
 
         await page.locator(
             "button.goal-card"
@@ -178,81 +251,105 @@ async def goals(profile, keyword):
         names = await page.locator(
             "button.goal-card"
         ).evaluate_all(
-            """buttons => buttons.map(b => (
-                b.querySelector('span.font-semibold')
-                    ?.innerText || b.innerText || ''
+            """buttons => buttons.map(button => (
+                button.querySelector('span.font-semibold')
+                    ?.innerText || button.innerText || ''
             ).trim()).filter(Boolean)"""
         )
 
-        if is_ca:
+        if term in {
+            "ca",
+            "commerce",
+            "chartered accountant",
+            "chartered accountants",
+        }:
             names = [
-                n for n in names
-                if n.upper().startswith("CA ")
+                name for name in names
+                if name.upper().startswith("CA ")
             ]
         else:
             names = [
-                n for n in names
-                if term in n.lower()
+                name for name in names
+                if term in name.lower()
             ]
 
-        result = []
+        names = list(dict.fromkeys(names))
+        semaphore = asyncio.Semaphore(3)
 
-        for name in dict.fromkeys(names):
-            uid = known.get(name)
+        async def discover_uid(name):
+            if name in verified:
+                return verified[name]
 
-            if not uid:
+            async with semaphore:
+                tab = await context.new_page()
+
                 try:
-                    await page.goto(
-                        category_url,
-                        wait_until="domcontentloaded",
-                        timeout=90000,
-                    )
+                    await load(tab, category_url)
 
-                    await page.locator(
+                    await tab.locator(
                         "button.goal-card"
                     ).first.wait_for(timeout=20000)
 
-                    await close_popup(page)
+                    await close_popup(tab)
 
-                    target = page.locator(
+                    target = tab.locator(
                         "button.goal-card"
                     ).filter(
-                        has=page.locator(
+                        has=tab.locator(
                             "span.font-semibold"
-                        ).get_by_text(name, exact=True)
+                        ).get_by_text(
+                            name,
+                            exact=True,
+                        )
                     ).first
 
-                    await target.click(timeout=12000)
+                    await target.click(timeout=15000)
 
-                    await page.wait_for_url(
-                        re.compile(r".*/goal/[A-Za-z0-9]+.*"),
+                    await tab.wait_for_url(
+                        re.compile(r"/goal/[A-Za-z0-9]+"),
                         timeout=15000,
                     )
 
                     match = re.search(
                         r"/goal/([A-Za-z0-9]+)",
-                        page.url,
+                        tab.url,
                     )
 
-                    if not match:
-                        continue
-
-                    uid = match.group(1)
+                    return match.group(1) if match else None
 
                 except Exception as error:
                     print(
-                        "Goal discovery skipped:",
+                        "Goal skipped:",
                         name,
-                        str(error)[:150],
+                        str(error)[:120],
                     )
-                    continue
+                    return None
 
-            result.append({
-                "uid": uid,
-                "name": name,
-                "type": "goal",
-                "url": BASE + "/goal/" + uid,
-            })
+                finally:
+                    await tab.close()
+
+        uids = await asyncio.gather(
+            *(discover_uid(name) for name in names)
+        )
+
+        result = []
+
+        for name, uid in zip(names, uids):
+            if uid:
+                result.append({
+                    "uid": uid,
+                    "name": name,
+                    "type": "goal",
+                    "url": BASE + "/goal/" + uid,
+                })
+
+        if result:
+            state = _read_state(profile)
+            state[cache_key] = {
+                "time": time.time(),
+                "items": result,
+            }
+            _write_state(profile, state)
 
         return result
 
@@ -260,9 +357,164 @@ async def goals(profile, keyword):
         await stop_browser(pw, context)
 
 
-# -------------------------------------------------
-# BATCHES / PACKS
-# -------------------------------------------------
+# ==================================================
+# OPEN PACK / BATCH THROUGH WEBSITE NAVIGATION
+# ==================================================
+
+async def _click_from_goal(page, goal_url, kind, uid):
+    separator = "&" if "?" in goal_url else "?"
+    url = goal_url + separator + "tab=batch"
+
+    await load(page, url)
+    await close_popup(page)
+
+    batch_tab = page.get_by_role(
+        "button",
+        name="Batches",
+        exact=True,
+    )
+
+    try:
+        if await batch_tab.is_visible():
+            await batch_tab.click(timeout=4000)
+    except Exception:
+        pass
+
+    selector = (
+        'a[href*="/'
+        + kind
+        + '/'
+        + uid
+        + '"]:visible'
+    )
+
+    unchanged = 0
+    previous = -1
+
+    for _ in range(60):
+        link = page.locator(selector).first
+
+        if await link.count():
+            await link.click(timeout=15000)
+
+            await page.wait_for_url(
+                re.compile(
+                    r"/"
+                    + re.escape(kind)
+                    + r"/"
+                    + re.escape(uid)
+                ),
+                timeout=20000,
+            )
+            return
+
+        count = await page.locator(
+            'a[href*="/pack/"],a[href*="/batch/"]'
+        ).count()
+
+        if count == previous:
+            unchanged += 1
+        else:
+            unchanged = 0
+
+        previous = count
+
+        more = page.get_by_role(
+            "button",
+            name=re.compile(
+                r"load more|show more|view more",
+                re.I,
+            ),
+        ).first
+
+        clicked = False
+
+        try:
+            if await more.is_visible():
+                await more.click(timeout=5000)
+                clicked = True
+        except Exception:
+            pass
+
+        if not clicked:
+            await page.evaluate(
+                "() => window.scrollTo(0, document.body.scrollHeight)"
+            )
+
+        await page.wait_for_timeout(650)
+
+        if unchanged >= 9:
+            break
+
+    raise RuntimeError(
+        f"{kind.title()} {uid} not found in goal listing"
+    )
+
+
+async def _subject_links(page):
+    for _ in range(15):
+        rows = normalize(
+            await collect_links(page, "batch")
+        )
+
+        if rows:
+            return rows
+
+        await page.wait_for_timeout(500)
+
+    return []
+
+
+async def _open_pack(page, pack):
+    goal_url = pack.get("parent_goal_url")
+    navigation_error = None
+
+    # Click from goal first because direct pack URLs
+    # may not initialize website state correctly.
+    if goal_url:
+        try:
+            await _click_from_goal(
+                page,
+                goal_url,
+                "pack",
+                pack["uid"],
+            )
+
+            await close_popup(page)
+
+            rows = await _subject_links(page)
+
+            if rows:
+                return rows
+
+        except Exception as error:
+            navigation_error = error
+
+    # Fallback for packs that support direct navigation.
+    await load(page, pack["url"])
+    await close_popup(page)
+
+    rows = await _subject_links(page)
+
+    if rows:
+        return rows
+
+    if navigation_error:
+        raise RuntimeError(
+            "Pack navigation failed: "
+            + str(navigation_error)
+        )
+
+    raise RuntimeError(
+        "No batch links found in pack "
+        + pack["uid"]
+        + ". Re-select it from the goal."
+    )
+
+
+# ==================================================
+# BATCH / PACK LIST
+# ==================================================
 
 async def batches(profile, goal):
     pw, context = await start_browser(profile)
@@ -290,44 +542,36 @@ async def batches(profile, goal):
         try:
             if await tab.is_visible():
                 await tab.click(timeout=5000)
-                await page.wait_for_timeout(1000)
         except Exception:
             pass
 
         found = {}
         stable = 0
 
-        for _ in range(50):
-            entries = normalize(
-                await collect_links(
-                    page,
-                    "pack|batch",
-                )
+        for _ in range(65):
+            rows = normalize(
+                await collect_links(page, "pack|batch")
             )
 
             before = len(found)
 
-            for item in entries:
-                key = (
-                    item["type"]
-                    + ":"
-                    + item["uid"]
-                )
-
+            for item in rows:
+                key = item["type"] + ":" + item["uid"]
                 old = found.get(key)
 
                 if (
                     not old
-                    or old["name"].endswith(
-                        " — " + item["uid"]
+                    or old["name"].startswith(
+                        item["type"].title() + " — "
                     )
                 ):
                     found[key] = item
 
-            if len(found) == before:
-                stable += 1
-            else:
-                stable = 0
+            stable = (
+                stable + 1
+                if len(found) == before
+                else 0
+            )
 
             more = page.get_by_role(
                 "button",
@@ -351,22 +595,30 @@ async def batches(profile, goal):
                     "() => window.scrollTo(0, document.body.scrollHeight)"
                 )
 
-            await page.wait_for_timeout(900)
+            await page.wait_for_timeout(650)
 
             if stable >= 5:
                 break
 
-        return list(found.values())
+        result = list(found.values())
+
+        for item in result:
+            item["parent_goal_url"] = goal["url"]
+
+        _remember(profile, result)
+        return result
 
     finally:
         await stop_browser(pw, context)
 
 
-# -------------------------------------------------
-# SUBJECTS - KEEP PARENT PACK CONTEXT
-# -------------------------------------------------
+# ==================================================
+# SUBJECT LIST
+# ==================================================
 
 async def subjects(profile, pack):
+    pack = _restore(profile, pack)
+
     if pack["type"] == "batch":
         return [pack]
 
@@ -379,53 +631,16 @@ async def subjects(profile, pack):
             else await context.new_page()
         )
 
-        await load(page, pack["url"])
-
-        await close_popup(page)
-
-        rows = await page.evaluate(
-            r"""() => {
-                const result = new Map();
-
-                for (const a of document.querySelectorAll('a[href]')) {
-                    const url = new URL(a.href);
-                    const match = url.pathname.match(
-                        /^\/batch\/([^/]+)\/?$/
-                    );
-
-                    if (!match || url.origin !== location.origin)
-                        continue;
-
-                    const lines = (a.innerText || '')
-                        .split('\n')
-                        .map(x => x.trim())
-                        .filter(Boolean);
-
-                    const name = lines.find(x =>
-                        x.length > 5 &&
-                        x.length < 170 &&
-                        !/^(view classes|view details|open|watch)$/i.test(x)
-                    ) || 'Batch — ' + match[1];
-
-                    const old = result.get(match[1]);
-
-                    if (!old || old.name.startsWith('Batch — ')) {
-                        result.set(match[1], {
-                            uid: match[1],
-                            type: 'batch',
-                            name: name,
-                            url: url.origin + url.pathname
-                        });
-                    }
-                }
-
-                return [...result.values()];
-            }"""
-        )
+        rows = await _open_pack(page, pack)
 
         for item in rows:
             item["parent_pack_url"] = pack["url"]
             item["parent_pack_uid"] = pack["uid"]
+            item["parent_goal_url"] = pack.get(
+                "parent_goal_url"
+            )
+
+        _remember(profile, rows)
 
         return rows
 
@@ -433,9 +648,9 @@ async def subjects(profile, pack):
         await stop_browser(pw, context)
 
 
-# -------------------------------------------------
+# ==================================================
 # CLASS EXTRACTION
-# -------------------------------------------------
+# ==================================================
 
 CLASS_JS = r"""
 () => {
@@ -483,7 +698,9 @@ CLASS_JS = r"""
 
         const pdfs = [...card.querySelectorAll('a[href]')]
             .filter(x =>
-                new URL(x.href).pathname.startsWith('/api/public/d/')
+                new URL(x.href).pathname.startsWith(
+                    '/api/public/d/'
+                )
             );
 
         classes.push({
@@ -508,11 +725,70 @@ CLASS_JS = r"""
 """
 
 
-# -------------------------------------------------
-# CLASSES - PACK CLICK NAVIGATION
-# -------------------------------------------------
+async def _open_batch(page, subject):
+    pack_url = subject.get("parent_pack_url")
+    goal_url = subject.get("parent_goal_url")
+
+    if pack_url:
+        pack = {
+            "uid": subject.get("parent_pack_uid")
+                or identifier(pack_url),
+            "type": "pack",
+            "url": pack_url,
+            "parent_goal_url": goal_url,
+        }
+
+        await _open_pack(page, pack)
+
+        selector = (
+            'a[href*="/batch/'
+            + subject["uid"]
+            + '"]:visible'
+        )
+
+        link = page.locator(selector).first
+
+        if not await link.count():
+            raise RuntimeError(
+                "Batch link missing inside parent pack: "
+                + subject["uid"]
+            )
+
+        await link.click(timeout=15000)
+
+    elif goal_url:
+        await _click_from_goal(
+            page,
+            goal_url,
+            "batch",
+            subject["uid"],
+        )
+
+    else:
+        await load(page, subject["url"])
+
+    await page.wait_for_function(
+        """() => {
+            const t = document.body.innerText || '';
+            return /classes total\\s*[·•]\\s*Showing\\s*\\d+/i.test(t)
+                || /Batch not found/i.test(t);
+        }""",
+        timeout=30000,
+    )
+
+    body = await page.locator("body").inner_text()
+
+    if "Batch not found" in body:
+        raise RuntimeError(
+            "Batch not found: "
+            + subject["uid"]
+            + ". Parent navigation may be missing."
+        )
+
 
 async def classes(profile, subject):
+    subject = _restore(profile, subject)
+
     pw, context = await start_browser(profile)
 
     try:
@@ -522,55 +798,13 @@ async def classes(profile, subject):
             else await context.new_page()
         )
 
-        parent = subject.get("parent_pack_url")
-
-        if parent:
-            # Direct batch URL does not work reliably.
-            # Open the parent pack, then click the subject.
-            await load(page, parent)
-            await close_popup(page)
-
-            link = page.locator(
-                'a[href*="/batch/'
-                + subject["uid"]
-                + '"]'
-            ).first
-
-            if not await link.count():
-                raise RuntimeError(
-                    "Subject link missing in parent pack: "
-                    + subject["uid"]
-                )
-
-            await link.click(timeout=15000)
-
-            await page.wait_for_function(
-                """() => {
-                    const t = document.body.innerText || '';
-                    return /classes total\\s*[·•]\\s*Showing\\s+\\d+/i.test(t)
-                        || /Batch not found/i.test(t);
-                }""",
-                timeout=30000,
-            )
-
-        else:
-            # Some listings have direct batch links only.
-            # Keep the original fallback for those cases.
-            await load(page, subject["url"])
-
-        text = await page.locator("body").inner_text()
-
-        if "Batch not found" in text:
-            raise RuntimeError(
-                "Batch not found. Parent pack navigation "
-                "may be required for " + subject["uid"]
-            )
+        await _open_batch(page, subject)
 
         found = {}
         previous_showing = -1
         stagnant = 0
 
-        for _ in range(40):
+        for _ in range(45):
             result = await page.evaluate(CLASS_JS)
 
             if result["total"] is None:
@@ -578,13 +812,13 @@ async def classes(profile, subject):
                     "Class count not found on page."
                 )
 
-            for item in result["classes"]:
-                found[item["class_number"]] = item
+            for lecture in result["classes"]:
+                found[lecture["class_number"]] = lecture
 
             if result["showing"] >= result["total"]:
                 return [
-                    found[k]
-                    for k in sorted(found)
+                    found[number]
+                    for number in sorted(found)
                 ], result["total"]
 
             if result["showing"] <= previous_showing:
@@ -606,26 +840,27 @@ async def classes(profile, subject):
             ).first
 
             try:
-                await button.click(timeout=6000)
+                await button.click(timeout=7000)
 
                 await page.wait_for_function(
                     """old => {
-                        const text = document.body.innerText || '';
-                        const m = text.match(
+                        const t = document.body.innerText || '';
+                        const m = t.match(
                             /classes total\\s*[·•]\\s*Showing\\s*(\\d+)/i
                         );
                         return m && Number(m[1]) > old;
                     }""",
                     arg=result["showing"],
-                    timeout=12000,
+                    timeout=15000,
                 )
 
             except Exception:
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(1200)
 
         raise RuntimeError(
-            "Incomplete class pagination; refusing "
-            "to mark this subject complete."
+            "Incomplete class pagination: "
+            + str(len(found))
+            + " playable links found."
         )
 
     finally:
