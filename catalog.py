@@ -87,23 +87,41 @@ async def stop_browser(pw, context):
 
 
 async def load(page, url):
-    await page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=90000,
-    )
-
-    await page.wait_for_timeout(1000)
-
-    if await page.get_by_text(
-        "Verify you're human",
-        exact=False,
-    ).count():
-        raise RuntimeError(
-            "Website verification required. "
-            "Use an authorized browser session."
+    for attempt in range(3):
+        await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=90000,
         )
+        await page.wait_for_timeout(2500)
 
+        # A successfully rendered page should not be
+        # mistaken for a verification challenge.
+        content_found = await page.locator(
+            "button.goal-card, "
+            'a[href*="/batch/"], '
+            'a[href*="/pack/"], '
+            'a[href*="/watch/"]'
+        ).count()
+
+        if content_found:
+            return
+
+        verify = page.get_by_text(
+            "Verify you're human",
+            exact=False,
+        ).first
+
+        if not await verify.is_visible():
+            return
+
+        if attempt < 2:
+            await page.wait_for_timeout(4000)
+
+    raise RuntimeError(
+        "Website verification required. "
+        "Use an authorized browser session."
+    )
 
 async def close_popup(page):
     dialog = page.locator(
