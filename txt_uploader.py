@@ -84,7 +84,12 @@ def parse_txt(path):
     if len(unique) > 500:
         raise ValueError("Maximum 500 lectures per TXT")
 
-    return list(unique.values())
+    # LECTURE_INDEX_FIX_V2
+    _items = list(unique.values())
+    for _index, _lecture in enumerate(_items, 1):
+        _lecture.setdefault("txt_index", _index)
+        _lecture.setdefault("txt_total", len(_items))
+    return _items
 
 
 def receipt_path(url):
@@ -333,20 +338,27 @@ async def upload_one(
                 current * 100 / total, 1
             )
 
+    # LECTURE_INDEX_FIX_V2
+    _txt_index = lecture.get("txt_index", "?")
+    _txt_total = lecture.get("txt_total", "?")
     caption = (
         f"{lecture['subject'][:100]}\n"
         f"Class {lecture['class_number']}: "
         f"{lecture['name'][:120]}\n"
         f"File: {kind}"
     )
+    caption = f"🎬 Index: {_txt_index}/{_txt_total}\n" + caption
 
-    message = await client.send_file(
-        destination,
-        str(path),
+    # PYROGRAM_UPLOAD_ENGINE_V1
+    from pyrogram_uploader import send_document
+
+    message = await send_document(
+        destination=destination,
+        filename=str(path),
         caption=caption,
-        reply_to=ACTIVE_TOPIC_ID,
-        force_document=True,
         progress_callback=on_progress,
+        topic_id=ACTIVE_TOPIC_ID,
+                        source_client=client,
     )
 
     uploaded[kind] = {
@@ -366,30 +378,34 @@ async def upload_one(
     return True
 
 
+
 async def progress_ticker(message):
+    # UPLOADER_REPAIR_V3
     last = ""
 
     while True:
         info = progress_info.copy()
 
-        mb = 1024 * 1024
-        speed = info.get("speed_bps", 0) / mb
-        current = info.get("current_bytes", 0) / mb
-        total = info.get("total_bytes", 0) / mb
+        speed = float(info.get("speed_bps") or 0) / 1048576
+        current = float(info.get("current_bytes") or 0) / 1048576
+        total = float(info.get("total_bytes") or 0) / 1048576
+
         eta = info.get("eta_seconds")
-        eta_text = (
-            f"{eta // 60}m {eta % 60}s"
-            if eta is not None else "Calculating"
-        )
+        if eta is None:
+            eta_text = "Calculating..."
+        else:
+            eta = max(0, int(eta))
+            eta_text = f"{eta // 60}m {eta % 60}s"
 
         output = (
             "📤 TXT Uploader\n\n"
-            f"Lecture: {info['lecture'][:110]}\n"
-            f"Progress: {info['done']}/{info['total']}\n"
-            f"Stage: {info['stage']}\n"
-            f"Percentage: {info['percent']}%\\n"
-            f"Speed: {speed:.2f} MB/s\\n"
-            f"Transferred: {current:.1f}/{total:.1f} MB\\n"
+            f"Lecture: {info.get('lecture', '')[:110]}\n"
+            f"Completed: {info.get('done', 0)}/"
+            f"{info.get('total', 0)}\n"
+            f"Stage: {info.get('stage', 'Idle')}\n"
+            f"Progress: {info.get('percent', 0)}%\n"
+            f"Speed: {speed:.2f} MB/s\n"
+            f"Transferred: {current:.1f}/{total:.1f} MB\n"
             f"ETA: {eta_text}"
         )
 
@@ -400,24 +416,32 @@ async def progress_ticker(message):
             except Exception:
                 pass
 
-        await asyncio.sleep(8)
+        await asyncio.sleep(5)
 
 
-async def run_upload(
-    client,
-    owner,
-    destination,
-    txt_path,
-):
+
+
+async def run_upload(client, owner, destination, txt_path):
+    # SLIDES_SINGLE_ZIP_V1
+    import zipfile
+    from pyrogram.errors import FloodWait
+
+    global ACTIVE_TOPIC_ID
+
     ticker = None
-    done = 0
+    completed = 0
+    partial = 0
     failed = 0
 
     try:
         lectures = parse_txt(txt_path)
 
-        # Batch topic selected before any download starts.
-        global ACTIVE_TOPIC_ID
+        if not lectures:
+            await client.send_message(
+                owner, "No valid watch links in TXT."
+            )
+            return
+
         from forum_topics import ensure_batch_topic
 
         ACTIVE_TOPIC_ID, batch_name = await ensure_batch_topic(
@@ -426,18 +450,10 @@ async def run_upload(
 
         await client.send_message(
             owner,
-            "📁 Batch Forum Topic Ready\\n"
-            f"Batch: {batch_name}\\n"
-            f"Topic ID: {ACTIVE_TOPIC_ID}\\n"
-            "All files will upload inside this topic."
+            f"📁 Batch Topic: {batch_name}\n"
+            f"Topic ID: {ACTIVE_TOPIC_ID}\n"
+            "🎬 Video + 📋 Board + 📦 One Slides ZIP"
         )
-
-        if not lectures:
-            await client.send_message(
-                owner,
-                "❌ TXT mein valid watch links nahi mile.",
-            )
-            return
 
         progress_info.update({
             "stage": "Starting",
@@ -445,158 +461,298 @@ async def run_upload(
             "done": 0,
             "total": len(lectures),
             "percent": 0,
+            "speed_bps": 0,
+            "current_bytes": 0,
+            "total_bytes": 0,
+            "eta_seconds": None,
         })
 
-        msg = await client.send_message(
-            owner,
-            f"✅ {len(lectures)} lectures loaded.\n"
-            "Starting download + Telegram upload.",
+        message = await client.send_message(
+            owner, f"📦 {len(lectures)} lectures loaded"
         )
+        ticker = asyncio.create_task(progress_ticker(message))
 
-        ticker = asyncio.create_task(progress_ticker(msg))
-
-        # Reuse exactly the resolver that successfully
-        # detected the extension-less WebM media URL.
         from watch_to_api import resolve_lecture
 
-        for lecture in lectures:
+        for position, lecture in enumerate(lectures, 1):
             url = lecture["watch_url"]
+            name = lecture["name"]
 
-            progress_info["lecture"] = lecture["name"]
-
-            receipt = load_receipt(url)
-
-            if receipt.get("complete"):
-                done += 1
-                progress_info["done"] = done
-                continue
+            progress_info.update({
+                "lecture": f"{position}/{len(lectures)} — {name}",
+                "stage": "Checking uploads",
+                "percent": 0,
+                "speed_bps": 0,
+                "current_bytes": 0,
+                "total_bytes": 0,
+                "eta_seconds": None,
+            })
 
             try:
-                progress_info["stage"] = "Resolving player"
-                progress_info["percent"] = 0
+                receipt = load_receipt(url)
 
+                if (
+                    receipt.get("complete")
+                    and receipt.get("slides_zip_version") == 1
+                ):
+                    completed += 1
+                    progress_info["done"] = completed
+                    continue
+
+                progress_info["stage"] = "Resolving video"
                 resolved = await resolve_lecture(lecture)
 
                 if not resolved.get("video_url"):
-                    raise RuntimeError(
-                        "Video URL not resolved"
-                    )
+                    raise RuntimeError("Video URL not resolved")
 
-                progress_info["stage"] = "API queued"
+                progress_info["stage"] = "Downloading resources"
+                job_id = await submit_api(lecture, resolved)
+                result = await wait_api(job_id)
+                entries = result.get("results") or []
 
-                api_job_id = await submit_api(
-                    lecture, resolved
-                )
+                if not entries:
+                    raise RuntimeError("API returned no file results")
 
-                result = await wait_api(api_job_id)
+                problems = []
+                slides = []
+                asset_failures = []
+                required = {"video"}
 
-                if result["status"] == "failed":
-                    raise RuntimeError(
-                        "API download failed"
-                    )
+                if any(
+                    x.get("kind") == "board" for x in entries
+                ):
+                    required.add("board")
 
-                successful = set()
-                upload_errors = []
+                # Video and board stay separate.
+                # Assets are collected, NOT uploaded individually.
+                for entry in entries:
+                    kind = entry.get("kind", "")
+                    status = entry.get("status", "")
+                    filename = entry.get("path")
 
-                for item in result.get("results", []):
-                    if item["status"] != "downloaded":
+                    if kind.startswith("asset_"):
+                        if status == "downloaded" and filename:
+                            try:
+                                path = validated_file(filename)
+                                if path.stat().st_size > 0:
+                                    slides.append((kind, path))
+                                else:
+                                    asset_failures.append(
+                                        f"{kind}: empty file"
+                                    )
+                            except Exception as error:
+                                asset_failures.append(
+                                    f"{kind}: {error}"
+                                )
+                        else:
+                            asset_failures.append(
+                                f"{kind}: {status} "
+                                f"{str(entry.get('error') or '')[:70]}"
+                            )
                         continue
 
-                    kind = item["kind"]
+                    if kind not in ("video", "board"):
+                        continue
 
-                    path = prepare_file(
-                        validated_file(item["path"]),
-                        kind,
-                    )
+                    if status != "downloaded" or not filename:
+                        problems.append(
+                            f"{kind}: download {status}"
+                        )
+                        continue
 
                     try:
+                        path = prepare_file(
+                            validated_file(filename), kind
+                        )
+
                         await upload_one(
-                            client,
-                            destination,
-                            lecture,
-                            url,
-                            kind,
-                            path,
+                            client, destination,
+                            lecture, url, kind, path
                         )
-                        successful.add(kind)
+                    except asyncio.CancelledError:
+                        raise
+                    except FloodWait:
+                        raise
                     except Exception as error:
-                        upload_errors.append(
-                            f"{kind}: {str(error)[:90]}"
+                        problems.append(
+                            f"{kind}: {type(error).__name__}: {error}"
                         )
 
-                # Recover a JPEG affected by the
-                # current Requests API size mismatch.
-                for index, item in enumerate(
-                    result.get("results", []), 1
-                ):
-                    if (
-                        item["status"] == "failed"
-                        and item["kind"].startswith("asset_")
-                    ):
-                        asset_path = recover_jpeg_part(
-                            api_job_id, index
-                        )
-
-                        if asset_path:
-                            try:
-                                await upload_one(
-                                    client,
-                                    destination,
-                                    lecture,
-                                    url,
-                                    item["kind"],
-                                    asset_path,
-                                )
-                                successful.add(item["kind"])
-                            except Exception as error:
-                                upload_errors.append(
-                                    str(error)[:100]
-                                )
-
-                expected = {
-                    item["kind"]
-                    for item in result.get("results", [])
-                }
-
-                receipt = load_receipt(url)
-                uploaded_kinds = set(
-                    receipt.get("uploaded", {})
+                # VIDEO_BOARD_BEFORE_ZIP_V1
+                # Never send slides until the main lecture
+                # files are confirmed uploaded to Telegram.
+                core_receipt = load_receipt(url)
+                core_uploaded = set(
+                    core_receipt.get("uploaded", {})
                 )
 
-                if not upload_errors and expected <= uploaded_kinds:
-                    receipt["complete"] = True
-                    save_receipt(url, receipt)
-                    done += 1
-                    progress_info["done"] = done
-                else:
-                    failed += 1
+                video_ready = "video" in core_uploaded
+                board_needed = (
+                    "board" in required
+                    or bool(resolved.get("board_json_url"))
+                )
+                board_ready = (
+                    not board_needed
+                    or "board" in core_uploaded
+                )
+
+                if not video_ready or not board_ready:
+                    details = "\\n".join(problems[:5])
+
                     await client.send_message(
                         owner,
-                        f"⚠️ Partial lecture:\n"
-                        f"{lecture['name'][:100]}\n"
-                        f"Uploaded: {len(uploaded_kinds)}"
-                        f"/{len(expected)}",
+                        f"❌ Main lecture files missing: "
+                        f"{name[:100]}\\n"
+                        f"🎬 Video: "
+                        f"{'✅' if video_ready else '❌'}\\n"
+                        f"📋 Board: "
+                        f"{'✅' if board_ready else '❌'}\\n"
+                        f"📦 ZIP: Not started\\n\\n"
+                        f"Errors:\\n"
+                        f"{details or 'API did not provide required files'}"
+                    )
+
+                    progress_info["stage"] = (
+                        "Stopped: video/board missing"
+                    )
+
+                    # Stop batch rather than sending slides
+                    # without the main lecture files.
+                    break
+
+                # Create exactly one archive per lecture.
+                if slides:
+                    folder = API_ROOT / str(job_id)
+                    zip_path = folder / "Lecture_Slides.zip"
+
+                    progress_info["stage"] = (
+                        f"Packing {len(slides)} slides into ZIP"
+                    )
+
+                    def make_zip():
+                        with zipfile.ZipFile(
+                            zip_path,
+                            "w",
+                            compression=zipfile.ZIP_STORED,
+                            allowZip64=True,
+                        ) as archive:
+                            for kind, source in slides:
+                                archive.write(
+                                    source,
+                                    arcname=source.name,
+                                )
+
+                        with zipfile.ZipFile(zip_path) as archive:
+                            bad = archive.testzip()
+                            if bad is not None:
+                                raise RuntimeError(
+                                    f"ZIP integrity failed: {bad}"
+                                )
+
+                    try:
+                        await asyncio.to_thread(make_zip)
+
+                        await upload_one(
+                            client, destination,
+                            lecture, url,
+                            "slides_zip", zip_path
+                        )
+
+                        # Assets can be cleaned only after
+                        # their ZIP is safely uploaded.
+                        for _, source in slides:
+                            source.unlink(missing_ok=True)
+
+                    except asyncio.CancelledError:
+                        raise
+                    except FloodWait:
+                        raise
+                    except Exception as error:
+                        problems.append(
+                            f"slides_zip: "
+                            f"{type(error).__name__}: {error}"
+                        )
+
+                receipt = load_receipt(url)
+                uploaded = set(receipt.get("uploaded", {}))
+
+                video_ok = "video" in uploaded
+                board_ok = (
+                    "board" not in required
+                    or "board" in uploaded
+                )
+                slides_ok = (
+                    not slides
+                    or "slides_zip" in uploaded
+                )
+
+                # Failed downloads are reported separately.
+                fully_ok = (
+                    video_ok and board_ok and slides_ok
+                    and not asset_failures
+                )
+
+                receipt["complete"] = fully_ok
+                receipt["slides_zip_version"] = 1
+                receipt["video_complete"] = video_ok
+                receipt["board_complete"] = board_ok
+                receipt["asset_download_errors"] = (
+                    asset_failures[:30]
+                )
+                save_receipt(url, receipt)
+
+                if fully_ok:
+                    completed += 1
+                    progress_info["done"] = completed
+                else:
+                    if video_ok and board_ok:
+                        partial += 1
+                    else:
+                        failed += 1
+
+                    details = problems + asset_failures
+
+                    await client.send_message(
+                        owner,
+                        f"⚠️ {name[:100]}\n"
+                        f"🎬 Video: {'✅' if video_ok else '❌'}\n"
+                        f"📋 Board: {'✅' if board_ok else '❌'}\n"
+                        f"📦 Slides ZIP: "
+                        f"{'✅' if 'slides_zip' in uploaded else '❌'}\n"
+                        f"Downloaded assets: {len(slides)}\n"
+                        f"Asset download errors: "
+                        f"{len(asset_failures)}\n"
+                        + "\n".join(details[:3])[:350]
                     )
 
             except asyncio.CancelledError:
                 raise
 
+            except FloodWait as error:
+                seconds = int(error.value)
+                await client.send_message(
+                    owner,
+                    f"⏳ Telegram FloodWait: {seconds}s\n"
+                    "Uploader safely stopped. "
+                    "Resume after the wait."
+                )
+                break
+
             except Exception as error:
                 failed += 1
                 await client.send_message(
                     owner,
-                    f"❌ Lecture failed:\n"
-                    f"{lecture['name'][:100]}\n"
+                    f"❌ {name[:100]}\n"
                     f"{type(error).__name__}: "
-                    f"{str(error)[:170]}",
+                    f"{str(error)[:300]}"
                 )
 
         await client.send_message(
             owner,
-            "🏁 TXT upload run finished\n\n"
-            f"Completed: {done}\n"
-            f"Failed/partial: {failed}\n"
-            f"Total: {len(lectures)}",
+            "🏁 Upload finished\n"
+            f"✅ Complete: {completed}\n"
+            f"⚠️ Partial: {partial}\n"
+            f"❌ Failed: {failed}"
         )
 
     finally:
@@ -604,8 +760,9 @@ async def run_upload(
             ticker.cancel()
 
         progress_info["stage"] = "Idle"
-
         txt_path.unlink(missing_ok=True)
+
+
 
 
 async def handle_upload_event(

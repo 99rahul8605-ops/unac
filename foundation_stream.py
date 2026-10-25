@@ -242,6 +242,33 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://app.bingolink.site",
+        "https://unaclec.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Range",
+        "X-Telegram-Init-Data",
+    ],
+    expose_headers=[
+        "Content-Range",
+        "Accept-Ranges",
+        "Content-Length",
+    ],
+)
+
+
+from foundation_slides import router as slides_router
+app.include_router(slides_router)
+
+
 
 @app.get("/health")
 async def health():
@@ -351,3 +378,6 @@ async def video(lecture_id: str, request: Request):
         media_type=mime,
         headers=headers
     )
+
+from session_security import install as install_session_security
+install_session_security(app)

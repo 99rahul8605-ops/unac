@@ -41,3 +41,27 @@ venv/
 install_speed.py
 fix_speed.py
 install_forum.py
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.pem
+*.key
+
+# Runtime data
+.state/
+exports/
+downloads/
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
+
+# Backups
+*.backup_*
+*.before_*
+*.bak_*

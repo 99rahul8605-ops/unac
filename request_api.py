@@ -1,3 +1,4 @@
+# FIX_DECOMPRESSED_LENGTH_V1
 
 import os
 import re
@@ -168,7 +169,7 @@ def download_one(session, url, destination, job_id):
 
                     last_update = now
 
-        if total and received != total:
+        if total and received < total:
             raise RuntimeError(
                 f"Incomplete download: {received}/{total}"
             )

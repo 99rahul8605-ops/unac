@@ -63,16 +63,22 @@ def _restore(profile, item):
     return {**saved, **item}
 
 
-async def start_browser(profile):
-    Path(profile).parent.mkdir(parents=True, exist_ok=True)
-    pw = await async_playwright().start()
+_CDP_CONTEXTS = {}
+CDP_URL = "http://127.0.0.1:9223"
 
+
+async def start_browser(profile):
+    import os
+    os.environ["DISPLAY"] = ":1"
+
+    pw = await async_playwright().start()
     try:
-        context = await pw.chromium.launch_persistent_context(
-            str(profile),
-            headless=True,
-            args=["--no-sandbox"],
-        )
+        browser = await pw.chromium.connect_over_cdp(CDP_URL, timeout=20000)
+        if not browser.contexts:
+            raise RuntimeError("CDP browser me koi context nahi mila")
+        context = browser.contexts[0]
+        _CDP_CONTEXTS[id(context)] = browser
+        print("CONNECTED TO EXISTING CHROMIUM CDP 9223 (profile arg ignored: %s)" % profile, flush=True)
         return pw, context
     except Exception:
         await pw.stop()
@@ -80,23 +86,35 @@ async def start_browser(profile):
 
 
 async def stop_browser(pw, context):
-    try:
-        await context.close()
-    finally:
-        await pw.stop()
+    _CDP_CONTEXTS.pop(id(context), None)
+    await pw.stop()
 
 
 async def load(page, url):
-    for attempt in range(3):
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=90000,
-        )
-        await page.wait_for_timeout(2500)
+    await page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=90000,
+    )
 
-        # A successfully rendered page should not be
-        # mistaken for a verification challenge.
+    # Wait for normal site content without repeatedly refreshing.
+    # Human verification, if requested, is completed manually in VNC.
+    for attempt in range(90):
+        verification = page.locator(
+            '[role="dialog"][aria-labelledby="verification-title"]'
+        )
+
+        if await verification.is_visible():
+            if attempt == 0:
+                print(
+                    "Human verification visible. "
+                    "Complete it manually in VNC.",
+                    flush=True,
+                )
+
+            await page.wait_for_timeout(2000)
+            continue
+
         content_found = await page.locator(
             "button.goal-card, "
             'a[href*="/batch/"], '
@@ -107,21 +125,13 @@ async def load(page, url):
         if content_found:
             return
 
-        verify = page.get_by_text(
-            "Verify you're human",
-            exact=False,
-        ).first
-
-        if not await verify.is_visible():
-            return
-
-        if attempt < 2:
-            await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(2000)
 
     raise RuntimeError(
-        "Website verification required. "
-        "Use an authorized browser session."
+        "Page did not become ready within 3 minutes. "
+        "Check website in VNC."
     )
+
 
 async def close_popup(page):
     dialog = page.locator(
