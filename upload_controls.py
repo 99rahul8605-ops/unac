@@ -22,6 +22,12 @@ async def handle_upload_event(event, client, owner, destination):
     text = (event.raw_text or "").strip()
     low = text.lower()
 
+    # DATA_SYNC_HOOK_V1
+    from data_sync import handle_sync_event
+
+    if await handle_sync_event(event, client, owner, active()):
+        return True
+
     if low == "/uploadstatus":
         info = uploader.progress_info
         await event.respond(
