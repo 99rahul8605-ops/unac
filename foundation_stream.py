@@ -15,8 +15,11 @@ from telethon import TelegramClient
 ROOT = Path("/root/unac")
 load_dotenv(ROOT / ".env")
 
-BATCH_NAME = "Yoddha Regular Batch for CA Foundation Jan'27/May'27"
-TOPIC_ID = 23
+BATCHES = [
+    ("Yoddha Regular Batch for CA Foundation Jan'27/May'27", 23),
+    ("Yoddha Regular Batch for CA Foundation May'26 / Sep'26", 459),
+]
+BATCH_NAME, TOPIC_ID = BATCHES[0]
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -43,7 +46,8 @@ def make_id(value):
     return (name[:65].strip("-") or "item") + "-" + digest
 
 
-def find_source():
+def find_source(batch_name=None):
+    batch_name = batch_name or BATCH_NAME
     paths = list((ROOT / "exports").rglob("*.txt"))
     paths += list(RECEIPTS.glob("input_*.txt"))
 
@@ -62,7 +66,7 @@ def find_source():
         if not batch:
             continue
 
-        if batch.group(1).strip() != BATCH_NAME:
+        if batch.group(1).strip() != batch_name:
             continue
 
         count = len(re.findall(
@@ -78,14 +82,10 @@ def find_source():
     return max(matches, key=lambda item: item[0])
 
 
-def refresh_index():
-    global video_index, last_refresh
-
-    source = find_source()
+def _index_one(batch_name, topic_id):
+    source = find_source(batch_name)
     if not source:
-        video_index = {}
-        last_refresh = time.time()
-        return
+        return {}
 
     _, path, content = source
     result = {}
@@ -118,7 +118,7 @@ def refresh_index():
                 continue
 
             digest = hashlib.sha256(
-                f"{TOPIC_ID}|{url}".encode()
+                f"{topic_id}|{url}".encode()
             ).hexdigest()
 
             receipt_path = RECEIPTS / f"{digest}.json"
@@ -151,19 +151,126 @@ def refresh_index():
 
             result[lecture_id] = {
                 "message_id": message_id,
+                "topic_id": topic_id,
+                "batch": batch_name,
                 "name": current_name,
                 "subject": current_subject,
                 "class_number": current_number,
             }
 
-    video_index = result
-    last_refresh = time.time()
-
     print(
-        f"Foundation source: {path.name} | "
-        f"Mapped videos: {len(video_index)}",
+        f"Source: {path.name} | {batch_name} | "
+        f"Mapped videos: {len(result)}",
         flush=True
     )
+    return result
+
+
+# AUTO_BATCH_DISCOVERY
+# New batches need no code change: any TXT with a BATCH: line is picked up,
+# and its Telegram topic is found from the upload receipts.
+_topic_cache = {}  # batch name -> (topic_id or None, receipts_seen, tried_at)
+
+
+def _all_batch_names():
+    paths = list((ROOT / "exports").rglob("*.txt"))
+    paths += list(RECEIPTS.glob("input_*.txt"))
+    names = set()
+
+    for path in set(paths):
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            continue
+
+        match = re.search(r"(?im)^BATCH:\s*(.+?)\s*$", content)
+        if match:
+            names.add(match.group(1).strip())
+
+    return names
+
+
+def _mapped_topic(batch_name):
+    """Topic ID saved by the upload bot when it created the batch topic."""
+    try:
+        data = json.loads(
+            (ROOT / ".state" / "batch_forum_topics.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return None
+
+    def norm(value):
+        return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+    want = norm(batch_name)
+
+    for key, value in data.items():
+        if norm(key.partition(":")[2]) == want:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+    return None
+
+
+def auto_topic(batch_name):
+    known = {path.stem for path in RECEIPTS.glob("*.json")}
+    hit = _topic_cache.get(batch_name)
+    now = time.time()
+
+    if hit:
+        topic, seen, tried = hit
+        if topic:
+            return topic
+        # Retry only when new receipts appeared, at most every 2 minutes.
+        if seen == len(known) or now - tried < 120:
+            return None
+
+    topic = None
+    source = find_source(batch_name)
+
+    if source and known:
+        urls = re.findall(
+            r"(?im)^WATCH_URL:\s*(https://\S+)", source[2]
+        )[:2]
+
+        for candidate in range(1, 200001):
+            if any(
+                hashlib.sha256(f"{candidate}|{url}".encode()).hexdigest()
+                in known
+                for url in urls
+            ):
+                topic = candidate
+                print(
+                    f"Auto-detected topic {topic} for {batch_name}",
+                    flush=True,
+                )
+                break
+
+    _topic_cache[batch_name] = (topic, len(known), now)
+    return topic
+
+
+def refresh_index():
+    global video_index, last_refresh
+
+    topics = dict(BATCHES)
+    merged = {}
+
+    for batch_name in sorted(_all_batch_names() | set(topics)):
+        topic_id = (
+            topics.get(batch_name)
+            or _mapped_topic(batch_name)
+            or auto_topic(batch_name)
+        )
+        if topic_id:
+            merged.update(_index_one(batch_name, topic_id))
+
+    video_index = merged
+    last_refresh = time.time()
 
 
 def verify_signature(lecture_id, expiry, signature):
@@ -277,8 +384,8 @@ async def health():
 
     return {
         "ok": True,
-        "batch": BATCH_NAME,
-        "topic_id": TOPIC_ID,
+        "batches": [b for b, _ in BATCHES],
+        "topic_ids": [t for _, t in BATCHES],
         "videos_mapped": len(video_index),
         "telegram_connected": TG.is_connected()
     }

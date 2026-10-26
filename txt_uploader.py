@@ -81,8 +81,8 @@ def parse_txt(path):
     for item in rows:
         unique[item["watch_url"]] = item
 
-    if len(unique) > 500:
-        raise ValueError("Maximum 500 lectures per TXT")
+    if len(unique) > 1000:
+        raise ValueError("Maximum 1000 lectures per TXT")
 
     # LECTURE_INDEX_FIX_V2
     _items = list(unique.values())

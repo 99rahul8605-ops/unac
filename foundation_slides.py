@@ -58,11 +58,10 @@ def get_receipt(lecture_id):
     if lecture_id not in s.video_index:
         raise HTTPException(404, "Video not uploaded")
 
-    source = s.find_source()
+    expected = s.video_index[lecture_id]
+    source = s.find_source(expected.get("batch"))
     if not source:
         raise HTTPException(404, "Source TXT missing")
-
-    expected = s.video_index[lecture_id]
     name = ""
     subject = ""
 
@@ -89,7 +88,7 @@ def get_receipt(lecture_id):
                 raise HTTPException(409, "Subject mismatch")
 
             digest = hashlib.sha256(
-                f"{TOPIC_ID}|{url}".encode()
+                f"{expected.get('topic_id', TOPIC_ID)}|{url}".encode()
             ).hexdigest()
 
             file = RECEIPTS / f"{digest}.json"

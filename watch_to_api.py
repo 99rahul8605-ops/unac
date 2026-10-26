@@ -110,6 +110,9 @@ async def resolve_lecture(lecture):
 
             await page.wait_for_timeout(5000)
 
+            last_asset_count = -1
+            stable_seconds = 0
+
             for attempt in range(30):
                 verify = page.get_by_text(
                     "Verify you're human",
@@ -146,8 +149,18 @@ async def resolve_lecture(lecture):
                     except Exception:
                         pass
 
+                # SLIDES_SETTLE_WAIT_V1
+                # Slide links arrive AFTER video/board. Keep waiting until
+                # no new slide link appeared for 6 seconds.
                 if video_urls and board_urls:
-                    break
+                    if len(assets) == last_asset_count:
+                        stable_seconds += 1
+                    else:
+                        stable_seconds = 0
+                        last_asset_count = len(assets)
+
+                    if stable_seconds >= 6:
+                        break
 
                 await asyncio.sleep(1)
 
