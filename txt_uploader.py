@@ -447,7 +447,7 @@ async def upload_one(
 
     if kind in uploaded:
         if kind != "slides_zip" or (
-            receipt.get("slides_zip_version") == 3
+            receipt.get("slides_zip_version") in (3, 4)
             and receipt.get("complete")
         ):
             return False
@@ -581,6 +581,22 @@ async def run_upload(client, owner, destination, txt_path):
     failed = 0
 
     try:
+        # Separate handler: legacy HRVertex flow remains unchanged.
+        from studyuk_uploader import is_studyuk_txt, run_studyuk_upload
+        if is_studyuk_txt(txt_path):
+            return await run_studyuk_upload(
+                client, owner, destination, txt_path,
+                progress_info=progress_info,
+                upload_one=upload_one,
+                wait_api=wait_api,
+                api_request=api_request,
+                load_receipt=load_receipt,
+                save_receipt=save_receipt,
+                work=WORK,
+                api_root=API_ROOT,
+                validated_file=validated_file,
+            )
+
         lectures = parse_txt(txt_path)
 
         if not lectures:
