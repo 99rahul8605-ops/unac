@@ -248,6 +248,9 @@ async def handle_upload_callback(event, client, owner, destination):
             state["start"] - 1:
         ]
 
+        # Path of the uploaded TXT, used by both source formats.
+        source = state["path"]
+
         if state.get("studyuk"):
             # Keep *all* direct media URLs and slide references. The legacy
             # reduced WATCH_URL TXT would silently discard these fields.
