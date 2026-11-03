@@ -19,6 +19,10 @@ TOPIC_ID = 23
 MAX_ZIP = 150 * 1024 * 1024
 MAX_SLIDE = 20 * 1024 * 1024
 MAX_FILES = 250
+# PDF attachment pages are served as images for the synced canvas.
+# Bound conversion work even when an uploaded PDF is very large.
+MAX_PDF_PAGES = 120
+MAX_PDF_PIXELS = 5_000_000
 
 router = APIRouter()
 locks = {}
@@ -254,6 +258,64 @@ async def cached_zip(lecture_id, message_id):
         return destination
 
 
+def pdf_pages(data):
+    """Number of browser-renderable pages; protected by per-file and page limits."""
+    try:
+        import fitz
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            if doc.needs_pass:
+                return 0
+            return min(len(doc), MAX_PDF_PAGES)
+    except Exception as exc:
+        print("PDF page inspection failed:", repr(exc), flush=True)
+        return 0
+
+
+def pdf_page_image(data, page):
+    """Render a single authenticated PDF page to an image for <canvas>."""
+    try:
+        import fitz
+    except ImportError:
+        raise HTTPException(503, "PDF renderer is not installed")
+
+    try:
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            if doc.needs_pass or not (1 <= page <= min(len(doc), MAX_PDF_PAGES)):
+                raise HTTPException(404, "PDF page unavailable")
+
+            sheet = doc.load_page(page - 1)
+            size = sheet.rect
+            if not size.width or not size.height:
+                raise HTTPException(422, "Invalid PDF page dimensions")
+
+            # About 1280px wide while bounding total decoded pixels.
+            zoom = min(2.0, 1280.0 / size.width,
+                       (MAX_PDF_PIXELS / (size.width * size.height)) ** 0.5)
+            pixmap = sheet.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            return pixmap.tobytes("jpeg", jpg_quality=83)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("PDF rendering failed:", repr(exc), flush=True)
+        raise HTTPException(422, "PDF page cannot be rendered")
+
+
+def pdf_entries(read_pdf, file_key, filename, url_base, budget):
+    """Expose JPEG page URLs without removing the original PDF download."""
+    pages = pdf_pages(read_pdf)
+    result = []
+    for page in range(1, min(pages, budget) + 1):
+        result.append({
+            "key": f"{file_key}_page_{page}",
+            "type": "pdf_page",
+            "name": f"slide_{page:03d}.jpg",
+            "original_name": Path(filename).name,
+            "page": page,
+            "url": f"{url_base}&page={page}",
+        })
+    return result
+
+
 def zip_entries(path):
     try:
         with zipfile.ZipFile(path) as archive:
@@ -294,15 +356,24 @@ async def manifest(lecture_id: str, request: Request):
 
     assets = assets_from(uploaded)
 
-    for _, key, _ in assets:
-        slides.append({
-            "key": key,
-            "type": "asset",
-            "name": key,
-            "url": (
-                f"/slides/{lecture_id}/asset/{key}?{query}"
-            )
-        })
+    for _, key, message_id in assets:
+        url = f"/slides/{lecture_id}/asset/{key}?{query}"
+        entry = {"key": key, "type": "asset", "name": key, "url": url}
+        slides.append(entry)
+        # Legacy individual uploads need the real filename to identify PDFs.
+        try:
+            message = await telegram_message(message_id)
+            filename = message.file.name or ""
+            if filename:
+                entry["name"] = Path(filename).name
+            if Path(filename).suffix.lower() == ".pdf" and message.file.size <= MAX_SLIDE:
+                pdf = io.BytesIO()
+                await stream().TG.download_media(message, file=pdf)
+                slides.extend(pdf_entries(
+                    pdf.getvalue(), key, filename, url, MAX_FILES - len(slides)
+                ))
+        except Exception as exc:
+            print("Legacy attachment metadata unavailable:", repr(exc), flush=True)
 
     zip_id = get_message_id(uploaded.get("slides_zip"))
     zip_error = None
@@ -312,16 +383,41 @@ async def manifest(lecture_id: str, request: Request):
             path = await cached_zip(lecture_id, zip_id)
             entries = zip_entries(path)
 
-            for index, filename in enumerate(entries):
-                slides.append({
-                    "key": f"zip_{index}",
-                    "type": "zip",
-                    "name": Path(filename).name,
-                    "url": (
-                        f"/slides/{lecture_id}/zip/{index}"
-                        f"?{query}"
-                    )
-                })
+            with zipfile.ZipFile(path) as archive:
+                mapping = {}
+                try:
+                    info = archive.getinfo("_slides_mapping.json")
+                    if info.file_size <= 65536:
+                        raw_map = json.loads(archive.read(info))
+                        if isinstance(raw_map, dict):
+                            mapping = {
+                                str(k): str(v)[:200].lower()
+                                for k, v in raw_map.items()
+                                if isinstance(k, str) and isinstance(v, str)
+                            }
+                except (KeyError, ValueError, zipfile.BadZipFile):
+                    pass
+                page_budget = MAX_FILES
+                for index, filename in enumerate(entries):
+                    url = f"/slides/{lecture_id}/zip/{index}?{query}"
+                    slides.append({
+                        "key": f"zip_{index}",
+                        "type": "zip",
+                        "name": Path(filename).name,
+                        "source_key": mapping.get(filename, ""),
+                        "url": url
+                    })
+                    if Path(filename).suffix.lower() == ".pdf" and page_budget:
+                        info = archive.getinfo(filename)
+                        if info.file_size <= MAX_SLIDE:
+                            pages = pdf_entries(
+                                archive.read(info), f"zip_{index}",
+                                filename, url, page_budget
+                            )
+                            if pages and mapping.get(filename):
+                                pages[0]["source_key"] = mapping[filename]
+                            slides.extend(pages)
+                            page_budget -= len(pages)
 
         except HTTPException as exc:
             zip_error = str(exc.detail)
@@ -343,7 +439,7 @@ async def manifest(lecture_id: str, request: Request):
 
 
 @router.get("/slides/{lecture_id}/asset/{asset_key}")
-async def asset(lecture_id: str, asset_key: str, request: Request):
+async def asset(lecture_id: str, asset_key: str, request: Request, page: int = 0):
     validate(lecture_id, request)
     uploaded = get_receipt(lecture_id)
 
@@ -373,12 +469,17 @@ async def asset(lecture_id: str, asset_key: str, request: Request):
         raise HTTPException(502, "Slide download failed")
 
     name = message.file.name or f"{asset_key}.jpg"
-
-    return media_response(buffer.getvalue(), name)
+    data = buffer.getvalue()
+    if page:
+        if Path(name).suffix.lower() != ".pdf":
+            raise HTTPException(404, "Not a PDF attachment")
+        image = await asyncio.to_thread(pdf_page_image, data, page)
+        return media_response(image, f"slide_{page:03d}.jpg")
+    return media_response(data, name)
 
 
 @router.get("/slides/{lecture_id}/zip/{index}")
-async def zip_slide(lecture_id: str, index: int, request: Request):
+async def zip_slide(lecture_id: str, index: int, request: Request, page: int = 0):
     validate(lecture_id, request)
     uploaded = get_receipt(lecture_id)
 
@@ -409,6 +510,11 @@ async def zip_slide(lecture_id: str, index: int, request: Request):
     except (OSError, RuntimeError, zipfile.BadZipFile):
         raise HTTPException(422, "Cannot read slide")
 
+    if page:
+        if Path(name).suffix.lower() != ".pdf":
+            raise HTTPException(404, "Not a PDF attachment")
+        image = await asyncio.to_thread(pdf_page_image, data, page)
+        return media_response(image, f"slide_{page:03d}.jpg")
     return media_response(data, name)
 
 

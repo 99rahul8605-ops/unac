@@ -5,7 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
@@ -236,6 +236,15 @@ def validated_file(filename):
 
     return path
 
+
+
+def source_asset_key(url):
+    """Only persist the basename/page key, never a signed source URL."""
+    parsed = urlsplit(str(url))
+    page = parse_qs(parsed.query).get("page", [""])[0]
+    if page.isdigit():
+        return f"slide_{int(page):03d}.jpg"
+    return unquote(parsed.path.rsplit("/", 1)[-1]).lower()[:200]
 
 def prepare_file(path, kind):
     """
@@ -636,10 +645,20 @@ async def run_upload(client, owner, destination, txt_path):
                             compression=zipfile.ZIP_STORED,
                             allowZip64=True,
                         ) as archive:
+                            mapping = {}
+                            sources = resolved.get("assets") or []
                             for kind, source in slides:
-                                archive.write(
-                                    source,
-                                    arcname=source.name,
+                                archive.write(source, arcname=source.name)
+                                try:
+                                    source_number = int(kind.split("_", 1)[1]) - 1
+                                    original = sources[source_number]
+                                    mapping[source.name] = source_asset_key(original)
+                                except (ValueError, IndexError, KeyError, TypeError):
+                                    pass
+                            if mapping:
+                                archive.writestr(
+                                    "_slides_mapping.json",
+                                    json.dumps(mapping, ensure_ascii=False),
                                 )
 
                         with zipfile.ZipFile(zip_path) as archive:
