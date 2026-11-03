@@ -610,18 +610,22 @@ async def message_handler(event):
         return
 
 
-    # AUTO_TXT_FLOW_V1
+    # STUDYUK_TXT_SOURCE_MENU_V1
     if low == "/txt":
-        menus[OWNER] = {
-            "step": "category",
-            "page": 0,
-            "mode": "txt",
-        }
+        from studyuk_txt import STATES as studyuk_states
+        studyuk_states.pop(OWNER, None)
+        menus.pop(OWNER, None)
         await event.respond(
-            "📄 TXT Generator\\n\\n"
-            "Category/search keyword bhejo.\\n"
-            "Example: CA / CA Intermediate"
+            "📄 TXT Generator\n\nChoose source:",
+            buttons=[
+                [Button.inline("📚 HRVertex (Old)", b"txtsource:hrvertex")],
+                [Button.inline("🎓 StudyUK (New)", b"txtsource:studyuk")],
+            ],
         )
+        return
+
+    from studyuk_txt import handle_message as studyuk_txt_message
+    if await studyuk_txt_message(event, OWNER):
         return
 
     if low in ("/start", "/search"):
@@ -874,6 +878,29 @@ async def callback_handler(event):
         await event.answer(
             "Not authorized",
             alert=True,
+        )
+        return
+
+    # STUDYUK_TXT_CALLBACK_ROUTE_V1
+    from studyuk_txt import handle_callback as studyuk_txt_callback
+    if await studyuk_txt_callback(event, OWNER):
+        return
+    source_choice = (event.data or b"").decode("utf-8", "replace")
+    if source_choice == "txtsource:studyuk":
+        await event.answer()
+        menus.pop(OWNER, None)
+        from studyuk_txt import start as studyuk_txt_start
+        await studyuk_txt_start(event, OWNER)
+        return
+    if source_choice == "txtsource:hrvertex":
+        await event.answer()
+        from studyuk_txt import STATES as studyuk_states
+        studyuk_states.pop(OWNER, None)
+        menus[OWNER] = {"step": "category", "page": 0, "mode": "txt"}
+        await event.respond(
+            "📄 HRVertex TXT Generator\n\n"
+            "Category/search keyword bhejo.\n"
+            "Example: CA / CA Intermediate"
         )
         return
 
