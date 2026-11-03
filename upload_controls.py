@@ -124,9 +124,16 @@ async def handle_upload_event(event, client, owner, destination):
         await event.download_media(file=str(path))
 
         try:
-            lectures = uploader.parse_txt(path)
+            # STUDYUK_UPLOAD_CONTROL_V1: validate either TXT format before
+            # asking for the starting lecture. Legacy parsing is unchanged.
+            from studyuk_uploader import is_studyuk_txt, parse_studyuk
+            studyuk = is_studyuk_txt(path)
+            if studyuk:
+                _, _, lectures, _ = parse_studyuk(path)
+            else:
+                lectures = uploader.parse_txt(path)
             if not lectures:
-                raise ValueError("No valid watch links")
+                raise ValueError("No valid lectures")
         except Exception as error:
             path.unlink(missing_ok=True)
             pending.pop(owner, None)
@@ -139,6 +146,7 @@ async def handle_upload_event(event, client, owner, destination):
             "step": "start_number",
             "path": path,
             "lectures": lectures,
+            "studyuk": studyuk,
         }
 
         await event.respond(
@@ -240,35 +248,48 @@ async def handle_upload_callback(event, client, owner, destination):
             state["start"] - 1:
         ]
 
-        # Existing run_upload() accepts a TXT path.
-        # Build a small TXT containing only the
-        # requested lecture range.
-        source = state["path"]
-
-        lines = [
-            "LECTURE MANAGER — SELECTED RANGE",
-            f"START INDEX: {state['start']}",
-            "",
-        ]
-
-        for lecture in selected:
-            lines.extend([
-                f"SUBJECT: {lecture['subject']}",
-                f"CLASS: {lecture['class_number']}",
-                f"LECTURE: {lecture['name']}",
-                f"WATCH_URL: {lecture['watch_url']}",
+        if state.get("studyuk"):
+            # Keep *all* direct media URLs and slide references. The legacy
+            # reduced WATCH_URL TXT would silently discard these fields.
+            from studyuk_uploader import parse_studyuk
+            batch, subject, _, _ = parse_studyuk(source)
+            lines = [f"BATCH: {batch}", f"SUBJECT: {subject}",
+                     "SOURCE_FORMAT: STUDYUK_DIRECT_V1", ""]
+            for lecture in selected:
+                lines.extend([
+                    f"CLASS: {lecture['class_number']}",
+                    f"LECTURE: {lecture['name']}",
+                    f"VIDEO_URL: {lecture['video_url']}",
+                    f"BOARD_URL: {lecture['board_url']}",
+                    f"PDF_URL: {lecture['pdf_url']}",
+                    f"SLIDES_COUNT: {len(lecture['slides'])}",
+                ])
+                lines.extend(
+                    f"SLIDE_URL_{j}: {url}"
+                    for j, url in enumerate(lecture['slides'], 1)
+                )
+                lines.append("")
+            source.write_text("\n".join(lines), encoding="utf-8")
+        else:
+            # Legacy HRVertex selection/routing remains byte-for-byte the
+            # same as before this change.
+            lines = [
+                "LECTURE MANAGER — SELECTED RANGE",
+                f"START INDEX: {state['start']}",
                 "",
-            ])
-
-        # BATCH_FORUM_HEADER_V1
-        from forum_topics import read_batch
-        batch_name = read_batch(source)
-        lines.insert(1, f"BATCH: {batch_name}")
-
-        source.write_text(
-            "\n".join(lines),
-            encoding="utf-8"
-        )
+            ]
+            for lecture in selected:
+                lines.extend([
+                    f"SUBJECT: {lecture['subject']}",
+                    f"CLASS: {lecture['class_number']}",
+                    f"LECTURE: {lecture['name']}",
+                    f"WATCH_URL: {lecture['watch_url']}",
+                    "",
+                ])
+            from forum_topics import read_batch
+            batch_name = read_batch(source)
+            lines.insert(1, f"BATCH: {batch_name}")
+            source.write_text("\n".join(lines), encoding="utf-8")
 
         pending.pop(owner, None)
         stop_requested = False
