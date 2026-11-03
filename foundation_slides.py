@@ -364,6 +364,51 @@ def zip_entries(path):
         raise HTTPException(422, "Invalid ZIP archive")
 
 
+
+
+def normalized_zip_names(archive, entries, mapping=None):
+    """Give old Telegram ZIP members browser-ready names without rewriting the ZIP.
+
+    Old uploader wrote 3_asset_1.jpg, 4_asset_2.pdf, ... although the
+    .pdf files actually contain JPEG image pages. The first direct JPG
+    is an extra image; numbered fake-PDF images are slide pages.
+    Explicit already-correct names are never changed. Mapping metadata
+    is preserved by the caller, not guessed from unrelated lectures.
+    """
+    extra_number = 0
+    page_number = 0
+    normalized = []
+    for filename in entries:
+        basename = Path(filename).name
+        extension = Path(basename).suffix.lower()
+        with archive.open(filename) as stream:
+            head = stream.read(16)
+        corrected = Path(correct_misnamed_pdf_image(basename, head)).name
+        actual_image = (head.startswith(b"\xff\xd8\xff") or
+                        head.startswith(b"\x89PNG\r\n\x1a\n") or
+                        (len(head) >= 12 and head[:4] == b"RIFF" and
+                         head[8:12] == b"WEBP"))
+        # Already fixed ZIPs use final player-facing names.
+        if re.fullmatch(r"(?:slide|extra)_\d+\.(?:jpg|jpeg|png|webp)",
+                        corrected, re.I):
+            normalized.append(corrected.lower())
+            continue
+        # Only re-map *known temporary uploader names*. Leave any other
+        # user-supplied / original filenames untouched.
+        old_temp = re.fullmatch(r"\d+_asset_(\d+)\.(?:jpg|jpeg|png|webp|pdf)",
+                                basename, re.I)
+        if old_temp and actual_image:
+            output_ext = Path(corrected).suffix.lower().lstrip('.')
+            if extension == '.pdf':
+                page_number += 1
+                corrected = f"slide_{page_number:03d}.{output_ext}"
+            else:
+                extra_number += 1
+                corrected = f"extra_{extra_number:03d}.{output_ext}"
+        normalized.append(corrected.lower())
+    return normalized
+
+
 @router.get("/slides/{lecture_id}/manifest")
 async def manifest(lecture_id: str, request: Request):
     exp, sig = validate(lecture_id, request)
@@ -422,26 +467,23 @@ async def manifest(lecture_id: str, request: Request):
                             }
                 except (KeyError, ValueError, zipfile.BadZipFile):
                     pass
+                # Repair is applied at *read time*. Telegram's uploaded ZIP
+                # remains unchanged and is served via signed /zip/{index}.
+                display_names = normalized_zip_names(archive, entries, mapping)
                 page_budget = MAX_FILES
                 for index, filename in enumerate(entries):
                     url = f"/slides/{lecture_id}/zip/{index}?{query}"
-                    # Older slide ZIPs contain real JPEG bytes mistakenly
-                    # named as .pdf. Inspect a small prefix, not the suffix.
-                    effective_name = filename
-                    if Path(filename).suffix.lower() == ".pdf":
-                        with archive.open(filename) as slide_file:
-                            effective_name = correct_misnamed_pdf_image(
-                                filename, slide_file.read(16)
-                            )
+                    effective_name = display_names[index]
                     slides.append({
                         "key": f"zip_{index}",
                         "type": "zip",
-                        "name": Path(effective_name).name,
+                        "name": effective_name,
+                        "original_name": Path(filename).name,
                         "source_key": mapping.get(filename, ""),
                         "url": url
                     })
                     if (Path(filename).suffix.lower() == ".pdf"
-                            and effective_name == filename and page_budget):
+                            and effective_name == filename.lower() and page_budget):
                         info = archive.getinfo(filename)
                         if info.file_size <= MAX_SLIDE:
                             pages = pdf_entries(
