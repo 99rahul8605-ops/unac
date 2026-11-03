@@ -239,12 +239,42 @@ def validated_file(filename):
 
 
 def source_asset_key(url):
-    """Only persist the basename/page key, never a signed source URL."""
+    """Same URL -> ZIP key rule as lecture_player.html assetKey()."""
     parsed = urlsplit(str(url))
     page = parse_qs(parsed.query).get("page", [""])[0]
     if page.isdigit():
         return f"slide_{int(page):03d}.jpg"
     return unquote(parsed.path.rsplit("/", 1)[-1]).lower()[:200]
+
+
+def board_asset_keys(path):
+    """Only attached-image references count; blank board pages have no URL."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError, UnicodeError) as exc:
+        raise ValueError(f"Board JSON cannot be inspected: {exc}") from exc
+
+    keys = []
+    seen = set()
+    todo = [data]
+    while todo:
+        node = todo.pop()
+        if isinstance(node, list):
+            todo.extend(node)
+        elif isinstance(node, dict):
+            if "plugin" in node and "p_time" in node:
+                if node.get("plugin") != "dcn":
+                    continue
+                info = node.get("data") or {}
+                if info.get("e") == "as" and info.get("u"):
+                    key = source_asset_key(info["u"])
+                    if key and key not in seen:
+                        seen.add(key)
+                        keys.append(key)
+            else:
+                todo.extend(x for x in node.values() if isinstance(x, (dict, list)))
+    return keys
+
 
 def prepare_file(path, kind):
     """
@@ -300,6 +330,119 @@ def recover_jpeg_part(job_id, index):
     return target
 
 
+# SLIDES_EXACT_JSON_NAME_V3
+# The download API uses temporary names such as 3_asset_1.jpg. The ZIP
+# MUST use keys extracted from the original URLs in Board JSON instead.
+MAX_ZIP_SLIDES = 250
+MAX_PDF_RENDER_PAGES = 120
+MAX_PDF_RENDER_PIXELS = 5_000_000
+
+
+def _slide_format(source):
+    with source.open('rb') as stream:
+        header = stream.read(16)
+    if header.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if header.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+        return 'webp'
+    if header.startswith((b'GIF87a', b'GIF89a')):
+        return 'gif'
+    if header.startswith(b'%PDF-'):
+        return 'pdf'
+    raise ValueError(f'Not a valid image/PDF download: {source.name}')
+
+
+def _safe_zip_slide_name(key, fmt, source_number):
+    """Keep the same name as the player key when image format permits."""
+    from pathlib import PurePosixPath
+    key = str(key or '').replace('\\', '/').split('/')[-1]
+    if key in ('', '.', '..') or key.startswith('_slides_'):
+        key = f'asset_{source_number:03d}.{fmt}'
+    # PDF/source URL can have the wrong extension. Actual bytes determine ext.
+    ext = PurePosixPath(key).suffix.lower()
+    if ext not in ('.jpg', '.jpeg', '.png', '.webp', '.gif') or (
+        fmt == 'pdf'
+    ):
+        key = str(PurePosixPath(key).with_suffix('.' + ('jpg' if fmt == 'pdf' else fmt)))
+    elif fmt != 'pdf':
+        # For JPEG .jpeg and .jpg are both valid. A wrong .pdf case was
+        # handled above; prevent PNG bytes being mislabeled as JPEG.
+        expected = 'jpg' if ext in ('.jpg', '.jpeg') else ext[1:]
+        if expected != fmt:
+            key = str(PurePosixPath(key).with_suffix('.' + fmt))
+    return key[:200]
+
+
+def write_slide_assets(archive, slides, asset_urls):
+    """Store each image using its Board JSON key, with explicit source mapping.
+
+    ZIP contents are actual JPEG/PNG/WebP/GIF bytes; genuine PDFs are
+    rasterized to JPG pages. Mapping supports URLs that point to .pdf files.
+    """
+    mapping = {}
+    taken = {}
+    output_count = 0
+    converted = 0
+
+    def add(name, payload, source_key):
+        nonlocal output_count
+        if name in taken:
+            # Identical repeated references are fine; different slides with
+            # one filename must never silently overwrite each other.
+            import hashlib
+            if taken[name] == hashlib.sha256(payload).digest():
+                return
+            raise ValueError(f'Conflicting slides share ZIP name: {name}')
+        import hashlib
+        taken[name] = hashlib.sha256(payload).digest()
+        archive.writestr(name, payload)
+        if source_key:
+            mapping[name] = source_key
+        output_count += 1
+
+    for kind, source in slides:
+        if output_count >= MAX_ZIP_SLIDES:
+            break
+        source_number = int(kind.split('_', 1)[1])
+        original_url = asset_urls[source_number - 1] if 0 < source_number <= len(asset_urls) else ''
+        key = source_asset_key(original_url) if original_url else ''
+        fmt = _slide_format(source)
+        name = _safe_zip_slide_name(key, fmt, source_number)
+
+        if fmt != 'pdf':
+            add(name, source.read_bytes(), key)
+            continue
+
+        # Import only for actual PDF bytes; JPEG-only uploads don't need fitz.
+        import fitz
+        with fitz.open(source) as pdf:
+            if pdf.needs_pass or not pdf.page_count:
+                raise ValueError(f'Invalid/protected PDF attachment: {source.name}')
+            pages = min(pdf.page_count, MAX_PDF_RENDER_PAGES,
+                        MAX_ZIP_SLIDES - output_count)
+            for page_no in range(pages):
+                page = pdf.load_page(page_no)
+                rect = page.rect
+                if rect.width <= 0 or rect.height <= 0:
+                    raise ValueError(f'Invalid PDF page: {source.name}')
+                zoom = min(2., 1280. / rect.width,
+                           (MAX_PDF_RENDER_PIXELS / (rect.width * rect.height)) ** .5)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                encoded = pix.tobytes('jpeg', jpg_quality=83)
+                image_name = name if page_no == 0 else (
+                    f'{Path(name).stem}_page_{page_no+1:03d}.jpg'
+                )
+                add(image_name, encoded, key if page_no == 0 else '')
+                converted += 1
+
+    if mapping:
+        archive.writestr('_slides_mapping.json',
+                         json.dumps(mapping, ensure_ascii=False))
+    return output_count, converted
+
+
 async def upload_one(
     client,
     destination,
@@ -312,7 +455,11 @@ async def upload_one(
     uploaded = receipt.get("uploaded", {})
 
     if kind in uploaded:
-        return False
+        if kind != "slides_zip" or (
+            receipt.get("slides_zip_version") == 2
+            and receipt.get("complete")
+        ):
+            return False
 
     progress_info["stage"] = f"Uploading {kind}"
     progress_info["percent"] = 0
@@ -502,7 +649,7 @@ async def run_upload(client, owner, destination, txt_path):
 
                 if (
                     receipt.get("complete")
-                    and receipt.get("slides_zip_version") == 1
+                    and receipt.get("slides_zip_version") == 2
                 ):
                     completed += 1
                     progress_info["done"] = completed
@@ -525,6 +672,16 @@ async def run_upload(client, owner, destination, txt_path):
                 problems = []
                 slides = []
                 asset_failures = []
+                expected_board_keys = []
+                for entry in entries:
+                    if entry.get("kind") == "board" and entry.get("status") == "downloaded":
+                        try:
+                            expected_board_keys = board_asset_keys(
+                                validated_file(entry["path"])
+                            )
+                        except Exception as err:
+                            problems.append(f"board asset inspection: {err}")
+                        break
                 required = {"video"}
 
                 if any(
@@ -638,28 +795,35 @@ async def run_upload(client, owner, destination, txt_path):
                         f"Packing {len(slides)} slides into ZIP"
                     )
 
+                    zip_missing_keys = []
+
                     def make_zip():
+                        nonlocal zip_missing_keys
                         with zipfile.ZipFile(
                             zip_path,
                             "w",
                             compression=zipfile.ZIP_STORED,
                             allowZip64=True,
                         ) as archive:
-                            mapping = {}
-                            sources = resolved.get("assets") or []
-                            for kind, source in slides:
-                                archive.write(source, arcname=source.name)
-                                try:
-                                    source_number = int(kind.split("_", 1)[1]) - 1
-                                    original = sources[source_number]
-                                    mapping[source.name] = source_asset_key(original)
-                                except (ValueError, IndexError, KeyError, TypeError):
-                                    pass
-                            if mapping:
-                                archive.writestr(
-                                    "_slides_mapping.json",
-                                    json.dumps(mapping, ensure_ascii=False),
-                                )
+                            written, converted = write_slide_assets(
+                                archive,
+                                slides,
+                                resolved.get("assets") or [],
+                            )
+                            print(
+                                f"Slides ZIP: {written} images, "
+                                f"{converted} PDF pages converted to JPEG",
+                                flush=True,
+                            )
+                            names = set(archive.namelist())
+                            mapping_raw = json.loads(archive.read('_slides_mapping.json')) if (
+                                '_slides_mapping.json' in names
+                            ) else {}
+                            available = names | set(mapping_raw.values())
+                            zip_missing_keys = [
+                                key for key in expected_board_keys
+                                if key not in available
+                            ]
 
                         with zipfile.ZipFile(zip_path) as archive:
                             bad = archive.testzip()
@@ -670,6 +834,11 @@ async def run_upload(client, owner, destination, txt_path):
 
                     try:
                         await asyncio.to_thread(make_zip)
+                        if zip_missing_keys:
+                            asset_failures.append(
+                                "Missing Board JSON attachments: "
+                                + ", ".join(zip_missing_keys[:8])
+                            )
 
                         await upload_one(
                             client, destination,
@@ -691,6 +860,20 @@ async def run_upload(client, owner, destination, txt_path):
                             f"slides_zip: "
                             f"{type(error).__name__}: {error}"
                         )
+                        asset_failures.append(f"slides_zip: {error}")
+
+                if expected_board_keys and not slides:
+                    asset_failures.append(
+                        "Board references attachments but the downloader captured none: "
+                        + ", ".join(expected_board_keys[:5])
+                    )
+                if not slides and receipt.get("uploaded", {}).get("slides_zip") and (
+                    receipt.get("slides_zip_version") != 2
+                ):
+                    asset_failures.append(
+                        "Previous slides ZIP has outdated names but no source "
+                        "assets were resolved to rebuild it"
+                    )
 
                 receipt = load_receipt(url)
                 uploaded = set(receipt.get("uploaded", {}))
@@ -702,7 +885,10 @@ async def run_upload(client, owner, destination, txt_path):
                 )
                 slides_ok = (
                     not slides
-                    or "slides_zip" in uploaded
+                    or (
+                        "slides_zip" in uploaded
+                        and not any("slides_zip:" in str(p) for p in problems)
+                    )
                 )
 
                 # Failed downloads are reported separately.
@@ -712,7 +898,7 @@ async def run_upload(client, owner, destination, txt_path):
                 )
 
                 receipt["complete"] = fully_ok
-                receipt["slides_zip_version"] = 1
+                receipt["slides_zip_version"] = 2
                 receipt["video_complete"] = video_ok
                 receipt["board_complete"] = board_ok
                 receipt["asset_download_errors"] = (

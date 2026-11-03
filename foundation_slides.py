@@ -174,6 +174,24 @@ def detected_mime(data, filename):
     raise HTTPException(415, "Unsupported slide format")
 
 
+def correct_misnamed_pdf_image(filename, header):
+    """Return an image name if .pdf is actually an image, else original name.
+
+    Renaming is only appropriate when the content bytes are really image bytes.
+    A genuine PDF must still use the PDF-page preview flow.
+    """
+    if Path(filename).suffix.lower() != ".pdf":
+        return filename
+    lower = header[:16]
+    if lower.startswith(b"\xff\xd8\xff"):
+        return str(Path(filename).with_suffix(".jpg"))
+    if lower.startswith(b"\x89PNG\r\n\x1a\n"):
+        return str(Path(filename).with_suffix(".png"))
+    if len(lower) >= 12 and lower[:4] == b"RIFF" and lower[8:12] == b"WEBP":
+        return str(Path(filename).with_suffix(".webp"))
+    return filename
+
+
 def media_response(data, filename):
     mime = detected_mime(data, filename)
 
@@ -369,9 +387,16 @@ async def manifest(lecture_id: str, request: Request):
             if Path(filename).suffix.lower() == ".pdf" and message.file.size <= MAX_SLIDE:
                 pdf = io.BytesIO()
                 await stream().TG.download_media(message, file=pdf)
-                slides.extend(pdf_entries(
-                    pdf.getvalue(), key, filename, url, MAX_FILES - len(slides)
-                ))
+                raw = pdf.getvalue()
+                real_name = correct_misnamed_pdf_image(filename, raw)
+                if real_name != filename:
+                    # This is already a JPEG/PNG/WebP; serve via the original
+                    # authenticated URL while advertising the usable image suffix.
+                    entry["name"] = Path(real_name).name
+                else:
+                    slides.extend(pdf_entries(
+                        raw, key, filename, url, MAX_FILES - len(slides)
+                    ))
         except Exception as exc:
             print("Legacy attachment metadata unavailable:", repr(exc), flush=True)
 
@@ -400,14 +425,23 @@ async def manifest(lecture_id: str, request: Request):
                 page_budget = MAX_FILES
                 for index, filename in enumerate(entries):
                     url = f"/slides/{lecture_id}/zip/{index}?{query}"
+                    # Older slide ZIPs contain real JPEG bytes mistakenly
+                    # named as .pdf. Inspect a small prefix, not the suffix.
+                    effective_name = filename
+                    if Path(filename).suffix.lower() == ".pdf":
+                        with archive.open(filename) as slide_file:
+                            effective_name = correct_misnamed_pdf_image(
+                                filename, slide_file.read(16)
+                            )
                     slides.append({
                         "key": f"zip_{index}",
                         "type": "zip",
-                        "name": Path(filename).name,
+                        "name": Path(effective_name).name,
                         "source_key": mapping.get(filename, ""),
                         "url": url
                     })
-                    if Path(filename).suffix.lower() == ".pdf" and page_budget:
+                    if (Path(filename).suffix.lower() == ".pdf"
+                            and effective_name == filename and page_budget):
                         info = archive.getinfo(filename)
                         if info.file_size <= MAX_SLIDE:
                             pages = pdf_entries(
