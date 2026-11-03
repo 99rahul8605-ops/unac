@@ -376,72 +376,63 @@ def _safe_zip_slide_name(key, fmt, source_number):
 
 
 def write_slide_assets(archive, slides, asset_urls):
-    """Store each image using its Board JSON key, with explicit source mapping.
-
-    ZIP contents are actual JPEG/PNG/WebP/GIF bytes; genuine PDFs are
-    rasterized to JPG pages. Mapping supports URLs that point to .pdf files.
-    """
+    """Write actual image data as slide_NNN or extra_NNN (never temp filenames)."""
+    import hashlib
+    counts = {'extra': 0}
+    seen = {}
     mapping = {}
-    taken = {}
     output_count = 0
     converted = 0
 
-    def add(name, payload, source_key):
+    def add(name, content, source_key):
         nonlocal output_count
-        if name in taken:
-            # Identical repeated references are fine; different slides with
-            # one filename must never silently overwrite each other.
-            import hashlib
-            if taken[name] == hashlib.sha256(payload).digest():
+        checksum = hashlib.sha256(content).hexdigest()
+        if name in seen:
+            if seen[name] == checksum:
                 return
-            raise ValueError(f'Conflicting slides share ZIP name: {name}')
-        import hashlib
-        taken[name] = hashlib.sha256(payload).digest()
-        archive.writestr(name, payload)
-        if source_key:
-            mapping[name] = source_key
+            raise ValueError(f'Conflicting contents for slide name: {name}')
+        seen[name] = checksum
+        archive.writestr(name, content)
+        mapping[name] = source_key or ''
         output_count += 1
 
     for kind, source in slides:
         if output_count >= MAX_ZIP_SLIDES:
             break
         source_number = int(kind.split('_', 1)[1])
-        original_url = asset_urls[source_number - 1] if 0 < source_number <= len(asset_urls) else ''
-        key = source_asset_key(original_url) if original_url else ''
+        url = asset_urls[source_number-1] if source_number <= len(asset_urls) else ''
+        key = source_asset_key(url) if url else ''
+        page = parse_qs(urlsplit(str(url)).query).get('page', [''])[0]
         fmt = _slide_format(source)
-        name = _safe_zip_slide_name(key, fmt, source_number)
+        if page.isdigit():
+            name = f'slide_{int(page):03d}.jpg'
+            if fmt not in ('jpg', 'pdf'):
+                name = f'slide_{int(page):03d}.{fmt}'
+        else:
+            counts['extra'] += 1
+            name = f"extra_{counts['extra']:03d}." + ('jpg' if fmt == 'pdf' else fmt)
 
         if fmt != 'pdf':
             add(name, source.read_bytes(), key)
             continue
 
-        # Import only for actual PDF bytes; JPEG-only uploads don't need fitz.
         import fitz
         with fitz.open(source) as pdf:
             if pdf.needs_pass or not pdf.page_count:
                 raise ValueError(f'Invalid/protected PDF attachment: {source.name}')
-            pages = min(pdf.page_count, MAX_PDF_RENDER_PAGES,
-                        MAX_ZIP_SLIDES - output_count)
-            for page_no in range(pages):
-                page = pdf.load_page(page_no)
-                rect = page.rect
+            pages = min(pdf.page_count, MAX_PDF_RENDER_PAGES, MAX_ZIP_SLIDES - output_count)
+            for i in range(pages):
+                p = pdf.load_page(i)
+                rect = p.rect
                 if rect.width <= 0 or rect.height <= 0:
                     raise ValueError(f'Invalid PDF page: {source.name}')
-                zoom = min(2., 1280. / rect.width,
-                           (MAX_PDF_RENDER_PIXELS / (rect.width * rect.height)) ** .5)
-                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-                encoded = pix.tobytes('jpeg', jpg_quality=83)
-                image_name = name if page_no == 0 else (
-                    f'{Path(name).stem}_page_{page_no+1:03d}.jpg'
-                )
-                add(image_name, encoded, key if page_no == 0 else '')
+                zoom = min(2.,1280./rect.width,(MAX_PDF_RENDER_PIXELS/(rect.width*rect.height))**.5)
+                pix = p.get_pixmap(matrix=fitz.Matrix(zoom,zoom),alpha=False)
+                page_name = name if i == 0 else f'{Path(name).stem}_page_{i+1:03d}.jpg'
+                add(page_name,pix.tobytes('jpeg',jpg_quality=83), key if i == 0 else '')
                 converted += 1
-
-    if mapping:
-        archive.writestr('_slides_mapping.json',
-                         json.dumps(mapping, ensure_ascii=False))
+    archive.writestr('_slides_mapping.json',json.dumps(mapping,ensure_ascii=False,indent=2))
     return output_count, converted
-
 
 async def upload_one(
     client,
@@ -456,7 +447,7 @@ async def upload_one(
 
     if kind in uploaded:
         if kind != "slides_zip" or (
-            receipt.get("slides_zip_version") == 2
+            receipt.get("slides_zip_version") == 3
             and receipt.get("complete")
         ):
             return False
@@ -649,7 +640,7 @@ async def run_upload(client, owner, destination, txt_path):
 
                 if (
                     receipt.get("complete")
-                    and receipt.get("slides_zip_version") == 2
+                    and receipt.get("slides_zip_version") == 3
                 ):
                     completed += 1
                     progress_info["done"] = completed
@@ -868,7 +859,7 @@ async def run_upload(client, owner, destination, txt_path):
                         + ", ".join(expected_board_keys[:5])
                     )
                 if not slides and receipt.get("uploaded", {}).get("slides_zip") and (
-                    receipt.get("slides_zip_version") != 2
+                    receipt.get("slides_zip_version") != 3
                 ):
                     asset_failures.append(
                         "Previous slides ZIP has outdated names but no source "
@@ -898,7 +889,7 @@ async def run_upload(client, owner, destination, txt_path):
                 )
 
                 receipt["complete"] = fully_ok
-                receipt["slides_zip_version"] = 2
+                receipt["slides_zip_version"] = 3
                 receipt["video_complete"] = video_ok
                 receipt["board_complete"] = board_ok
                 receipt["asset_download_errors"] = (
