@@ -23,6 +23,7 @@ MAX_FILES = 250
 # Bound conversion work even when an uploaded PDF is very large.
 MAX_PDF_PAGES = 120
 MAX_PDF_PIXELS = 5_000_000
+SLIDE_REPAIR_VERSION = "2026-11-03-v3"
 
 router = APIRouter()
 locks = {}
@@ -479,11 +480,14 @@ async def manifest(lecture_id: str, request: Request):
                         "type": "zip",
                         "name": effective_name,
                         "original_name": Path(filename).name,
-                        "source_key": mapping.get(filename, ""),
+                        # Source key must be a usable player-facing key.
+                        # Old archives lack mapping metadata, so use the
+                        # normalized name instead of an empty string.
+                        "source_key": mapping.get(filename) or effective_name,
                         "url": url
                     })
                     if (Path(filename).suffix.lower() == ".pdf"
-                            and effective_name == filename.lower() and page_budget):
+                            and effective_name == Path(filename).name.lower() and page_budget):
                         info = archive.getinfo(filename)
                         if info.file_size <= MAX_SLIDE:
                             pages = pdf_entries(
@@ -504,6 +508,15 @@ async def manifest(lecture_id: str, request: Request):
 
     return {
         "ok": True,
+        "repair_version": SLIDE_REPAIR_VERSION,
+        "repair_stats": {
+            "normalized": sum(
+                1 for item in slides
+                if item.get("type") == "zip" and
+                item.get("name") != item.get("original_name", item.get("name"))
+            ),
+            "zip_images": sum(1 for item in slides if item.get("type") == "zip"),
+        },
         "slides": slides,
         "count": len(slides),
         "has_zip": bool(zip_id),
