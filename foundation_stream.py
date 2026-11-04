@@ -9,16 +9,24 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from telethon import TelegramClient
 
 ROOT = Path("/root/unac")
 load_dotenv(ROOT / ".env")
 
 BATCHES = [
+    ("Sankalp Regular Batch for CA Foundation May\'26/Sep\'26", 4192),
     ("Yoddha Regular Batch for CA Foundation Jan'27/May'27", 23),
     ("Yoddha Regular Batch for CA Foundation May'26 / Sep'26", 459),
+    ("Yoddha Regular Batch for CA Intermediate Jan '27/ May '27", 1600),
 ]
+BATCHES.append(
+    ("CA Final DT - Regular course on DT for May 2026/ Sep 2026 by CA Arvind Tuli", 3229)
+)
+
+BATCHES.extend([("Sankalp Regular Batch for CA Intermediate G2 Jan' 27/ May'27", 3606), ("Audit Batch for May'26/Sep'26 by CA Ankit Oberoi", 4902)])
+
 BATCH_NAME, TOPIC_ID = BATCHES[0]
 
 API_ID = int(os.environ["API_ID"])
@@ -445,19 +453,24 @@ async def video(lecture_id: str, request: Request):
         )
 
     if request.method == "HEAD":
-        return JSONResponse(
+        return Response(
             status_code=206 if partial else 200,
-            content=None,
-            headers=headers
+            headers=headers,
+            media_type=mime
         )
 
     async def chunks():
         remaining = end - start + 1
 
+        # Start at a Telegram-safe 1 MiB boundary.
+        block_size = 1048576
+        aligned_start = (start // block_size) * block_size
+        skip = start - aligned_start
+
         try:
             async for part in TG.iter_download(
                 message.media,
-                offset=start,
+                offset=aligned_start,
                 request_size=524288,
                 chunk_size=524288,
                 file_size=size
@@ -465,18 +478,35 @@ async def video(lecture_id: str, request: Request):
                 if remaining <= 0:
                     break
 
+                if skip:
+                    if len(part) <= skip:
+                        skip -= len(part)
+                        continue
+                    part = part[skip:]
+                    skip = 0
+
                 data = part[:remaining]
                 if not data:
                     break
 
-                yield data
                 remaining -= len(data)
+                yield data
 
                 if remaining <= 0:
                     break
 
+            if remaining > 0:
+                raise RuntimeError(
+                    f"Telegram stream ended {remaining} bytes early"
+                )
+
         except Exception as exc:
-            print("Telegram streaming error:", repr(exc), flush=True)
+            print(
+                f"Telegram streaming error: "
+                f"start={start}, aligned={aligned_start}, "
+                f"end={end}, error={exc!r}",
+                flush=True
+            )
             raise
 
     return StreamingResponse(
