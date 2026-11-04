@@ -3,7 +3,7 @@
 set -Eo pipefail
 
 cd /root/unac
-PYTHON="/root/.venv/bin/python3"
+PYTHON="/root/unac/venv/bin/python"
 
 for file in bot.py request_api.py .env; do
     [[ -f "$file" ]] || { echo "ERROR: Missing: $file"; exit 1; }
@@ -34,13 +34,13 @@ screen -wipe >/dev/null 2>&1 || true
 screen -dmS lecture_api bash -c '
     cd /root/unac
     export LECTURE_API_KEY="$(cat .state/lecture_api.key)"
-    exec /root/.venv/bin/python3 -m uvicorn request_api:app \
+    exec /root/unac/venv/bin/python -m uvicorn request_api:app \
         --host 127.0.0.1 --port 8091 >> logs/lecture_api.log 2>&1
 '
 
 screen -dmS unac_bot bash -c '
     cd /root/unac
-    exec /root/.venv/bin/python3 bot.py >> logs/bot.log 2>&1
+    exec /root/unac/venv/bin/python bot.py >> logs/bot.log 2>&1
 '
 
 sleep 8
@@ -49,7 +49,7 @@ echo ""
 echo "===== STATUS ====="
 screen -ls | grep -E "lecture_api|unac_bot" || echo "ERROR: koi screen nahi chala"
 
-BOTS="$(pgrep -fc '^/root/.venv/bin/python3 bot.py$' || true)"
+BOTS="$(pgrep -fc '^/root/unac/venv/bin/python bot.py$' || true)"
 echo "bot.py processes: ${BOTS} (1 hona chahiye)"
 
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8091/health || true)"
@@ -57,8 +57,8 @@ echo "lecture_api HTTP: ${CODE} (000 = band hai)"
 
 if [[ ! -d "$HOME/.cache/ms-playwright" ]]; then
     echo "WARNING: Playwright Chromium install nahi hai:"
-    echo "   /root/.venv/bin/python3 -m playwright install chromium"
-    echo "   /root/.venv/bin/python3 -m playwright install-deps chromium"
+    echo "   /root/unac/venv/bin/python -m playwright install chromium"
+    echo "   /root/unac/venv/bin/python -m playwright install-deps chromium"
 fi
 
 if [[ "$CODE" == "000" ]]; then

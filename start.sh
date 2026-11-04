@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 cd /root/unac
 
-PYTHON="/root/.venv/bin/python3"
+PYTHON="/root/unac/venv/bin/python"
 API_SCREEN="lecture_api"
 BOT_SCREEN="unac_bot"
 STREAM_SCREEN="foundation_stream"
@@ -61,7 +61,7 @@ mkdir -p logs
 screen -dmS "$API_SCREEN" bash -c '
     cd /root/unac
     export LECTURE_API_KEY="$(cat .state/lecture_api.key)"
-    exec /root/.venv/bin/python3 -m uvicorn \
+    exec /root/unac/venv/bin/python -m uvicorn \
         request_api:app \
         --host 127.0.0.1 \
         --port 8091
@@ -70,7 +70,7 @@ screen -dmS "$API_SCREEN" bash -c '
 # Start Telegram bot
 screen -dmS "$BOT_SCREEN" bash -c '
     cd /root/unac
-    exec /root/.venv/bin/python3 bot.py
+    exec /root/unac/venv/bin/python bot.py
 '
 
 # Start video stream server (port 8092) if not already running
@@ -79,7 +79,7 @@ if is_running "$STREAM_SCREEN"; then
 else
     screen -dmS "$STREAM_SCREEN" bash -lc '
         cd /root/unac
-        exec /root/.venv/bin/python3 -m uvicorn \
+        exec /root/unac/venv/bin/python -m uvicorn \
             foundation_stream:app \
             --host 127.0.0.1 \
             --port 8092
