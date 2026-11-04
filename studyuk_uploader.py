@@ -274,8 +274,9 @@ async def run_studyuk_upload(client, owner, destination, txt_path, *, progress_i
                 if 'video' not in uploaded or 'board' not in uploaded:
                     await client.send_message(owner, f'❌ {name}: main Video/Board unavailable; ZIP skipped. ' + '; '.join(problems)[:200])
                     failed += 1
-                    # Prevent an out-of-order partially uploaded course.
-                    break
+                    # This lecture is unavailable (e.g. Board HTTP 403).
+                    # Record the failure and continue processing remaining lectures.
+                    continue
 
                 # The TXT contains URLs from the same Board JSON. Preserve
                 # exact original URLs (including query parameters) for matching.
